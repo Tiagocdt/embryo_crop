@@ -249,6 +249,40 @@ A 90,000-frame plate is 29 GB of image data but can occupy 88 GB on a large
 exFAT volume. Check before planning space — `diskutil info /Volumes/NAME` on
 macOS, `stat -f` or `tune2fs -l` on Linux.
 
+## Running on a cluster (and why there is no job array)
+
+If your raw data lives on a network share, **do not process it over SMB/CIFS**.
+Listing one acquisition folder means a metadata round-trip per file, and these
+folders hold hundreds of thousands of files: the same directory that a cluster
+node enumerates natively in ~5 s can take many minutes over SMB, and file
+browsers routinely hang on it outright. Run the tool where the filesystem is
+native instead.
+
+`cluster_job.sh` is a SLURM example — edit the partition and the `module load`
+line for your site, then:
+
+```bash
+sbatch cluster_job.sh RAW_DIR OUT_DIR PLATE --scaling image
+```
+
+It submits **one job**, not an array. The work is I/O-bound and detection runs
+a handful of times per well, so nothing here needs many machines — it needs many
+reads in flight, which a thread pool inside a single job provides. Scale
+`--cpus-per-task` and `--workers` together until the filesystem saturates. An
+array is the right tool for CPU-bound independent tasks, or when one task cannot
+finish inside the wall-clock limit; neither applies here, and an array adds N
+queue waits, N interpreters and N re-reads of the file index.
+
+Two traps this script already handles, both of which produce confusing errors:
+
+- **SLURM copies your script to a node spool directory**, so `${BASH_SOURCE[0]}`
+  does not point at your checkout. Use `$SLURM_SUBMIT_DIR`, or `mkdir logs`
+  fails with *Permission denied* on a directory that is plainly writable.
+- **EasyBuild-style modules export `PYTHONPATH`, which a venv does not
+  isolate.** A module's older numpy will shadow the venv's and recent tifffile
+  dies with `TypeError: 'copy' is an invalid keyword argument`. Load a module
+  that already provides numpy >= 2, or unset `PYTHONPATH` after loading.
+
 ## Related
 
 [**PlateNotate**](https://github.com/Tiagocdt/platenotate) — annotate the crops

@@ -10,5 +10,11 @@
 # Optional: install `imagecodecs` only if your microscope writes COMPRESSED
 # TIFFs. ACQUIFER frames are uncompressed, so it is not needed by default.
 
-numpy>=1.24
-tifffile>=2023.1.1
+# numpy 2.x is REQUIRED: recent tifffile calls ndarray.reshape(copy=...), which
+# only exists in numpy >= 2.0, but tifffile does not declare that in its own
+# metadata. With `numpy>=1.24` pip will happily install numpy 1.26 alongside a
+# 2026 tifffile and the pair crashes at the first imread():
+#     TypeError: 'copy' is an invalid keyword argument for this function
+# Found on an HPC module stack that ships numpy 1.26.
+numpy>=2.0
+tifffile>=2024.1.1
