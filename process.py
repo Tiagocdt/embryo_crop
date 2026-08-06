@@ -178,7 +178,10 @@ class Settings:
         self.fov_mm = float(kw.get("fov_mm", DEFAULT_FOV_MM))
         self.output_px = int(kw.get("output_px", DEFAULT_OUTPUT_PX))
         self.um_per_px_override = kw.get("um_per_px_override") or None
+        # one mode, or a per-channel spec like "plate,CO6=image"
         self.scaling = kw.get("scaling", "plate")
+        # convenience: mode for whichever channel is brightfield
+        self.bf_scaling = kw.get("bf_scaling") or None
         self.low_pct = float(kw.get("low_pct", 1.0))
         self.high_pct = float(kw.get("high_pct", 99.9))
         self.fixed_lo = kw.get("fixed_lo")
@@ -209,30 +212,33 @@ class Settings:
 
 
 def _sample_frames(idx, channel, n):
-    """Frames spread evenly over wells AND timepoints, for the histogram."""
-    keys = [k for k in idx.frames if k[2] == channel and k[3] == idx.detect_slice]
-    keys.sort()
-    if not keys:
-        keys = sorted(k for k in idx.frames if k[2] == channel)
+    """Frames spread evenly over EVERY well, timepoint AND z-slice.
+
+    The sample must span the whole channel, not just the detection slice: a
+    z-stack is not uniformly bright, so percentiles taken from one slice give a
+    map that clips or flattens the others. Sorting by (well, timepoint,
+    channel, slice) and then striding takes an even spread across all three.
+    """
+    keys = sorted(k for k in idx.frames if k[2] == channel)
     if n <= 0 or n >= len(keys):
         return keys
     step = len(keys) / float(n)
     return [keys[int(i * step)] for i in range(n)]
 
 
-def compute_calibration(idx, st, channel, log=print):
-    """One LO/HI per channel, over the scope the user asked for."""
-    if st.scaling == "raw16":
+def compute_calibration(idx, st, channel, mode, log=print):
+    """One LO/HI for `channel`, over the scope `mode` asks for."""
+    if mode == "raw16":
         return {"mode": "raw16", "lo": None, "hi": None}
-    if st.scaling == "fixed":
+    if mode == "fixed":
         if st.fixed_lo is None or st.fixed_hi is None:
             raise RuntimeError("scaling 'fixed' needs --fixed-lo and --fixed-hi "
                                "(the two raw counts that map to 0 and 255)")
         return {"mode": "fixed", "lo": float(st.fixed_lo),
                 "hi": float(st.fixed_hi)}
-    if st.scaling == "image":
+    if mode == "image":
         return {"mode": "image", "lo": None, "hi": None}
-    if st.scaling == "well":
+    if mode == "well":
         return {"mode": "well", "lo": None, "hi": None}
 
     keys = _sample_frames(idx, channel, st.stats_sample)
@@ -255,6 +261,48 @@ def compute_calibration(idx, st, channel, log=print):
             "sampled_all": st.stats_sample <= 0 or len(keys) == len(idx.frames)}
 
 
+def resolve_scaling(spec, channels, detect_channel, bf_scaling=None):
+    """Work out the scaling mode for EVERY channel. Returns {channel: mode}.
+
+    Brightfield and fluorescence want opposite things and usually sit in the
+    same plate, so one mode for the whole plate is not enough:
+
+        fluorescence -> `plate`, so wells and timepoints are comparable
+        brightfield  -> `image`, because transmitted-light illumination varies
+                        well to well and that is an instrument artefact
+
+    `spec` is either one mode for everything ("plate"), or a comma-separated
+    list where a bare word sets the default and CHANNEL=MODE overrides one
+    channel:
+
+        "image"                     every channel per-image
+        "plate,CO6=image"           fluorescence by plate, CO6 per-image
+        "CO6=image,CO2=raw16"       explicit, default stays "plate"
+
+    `bf_scaling` is the convenience form: it applies to whichever channel was
+    auto-detected as brightfield, so you do not have to know its number.
+    """
+    default = "plate"
+    per = {}
+    for tok in str(spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "=" in tok:
+            ch, _, mode = tok.partition("=")
+            per[ch.strip()] = mode.strip()
+        else:
+            default = tok
+    if bf_scaling and detect_channel:
+        per[detect_channel] = bf_scaling
+    out = {ch: per.get(ch, default) for ch in channels}
+    bad = {c: m for c, m in out.items() if m not in SCALING_MODES}
+    if bad:
+        raise RuntimeError(
+            f"unknown scaling mode(s) {bad}; pick from {list(SCALING_MODES)}")
+    return out
+
+
 def run(st: Settings, log=print, progress=None, should_stop=None):
     """Process one plate. `progress(done, total, message)` drives the GUI."""
     t_start = time.perf_counter()
@@ -271,7 +319,12 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
 
     log(idx.summary(st.fov_mm, st.output_px, um))
     log(f"crop {crop_px} px @ {um} um/px  ->  {st.output_px}px output")
-    log(f"channels {channels}  slices {slices}  scaling={st.scaling}")
+    modes = resolve_scaling(st.scaling, channels, idx.detect_channel,
+                            st.bf_scaling)
+    log(f"channels {channels}  slices {slices}")
+    for ch in channels:
+        tag = "  (brightfield/detect)" if ch == idx.detect_channel else ""
+        log(f"  scaling {ch} = {modes[ch]}{tag}")
 
     # --- 3. detect once per well, on the detect slice/channel -----------
     log("detecting embryos ...")
@@ -303,12 +356,13 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
 
     # --- 6a. calibration per channel ------------------------------------
     log("computing intensity calibration ...")
-    calib = {ch: compute_calibration(idx, st, ch, log) for ch in channels}
+    calib = {ch: compute_calibration(idx, st, ch, modes[ch], log)
+             for ch in channels}
 
     # per-well calibration if that is the chosen scope
     well_calib = {}
-    if st.scaling == "well":
-        for ch in channels:
+    if "well" in modes.values():
+        for ch in [c for c in channels if modes[c] == "well"]:
             for pos in idx.positions:
                 keys = [k for k in idx.frames
                         if k[0] == pos and k[2] == ch and k[3] == dsl]
@@ -353,15 +407,16 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         cy, cx = centers[pos]
         c, _fill = crop_at(img, cy, cx, crop_px)
         c = resize(c, st.output_px)
-        if st.scaling == "image":
+        mode = modes[ch]
+        if mode == "image":
             lo, hi = percentiles_from_hist(
                 accumulate(np.zeros(HIST_BINS, dtype=np.int64), c),
                 [st.low_pct, st.high_pct])
-        elif st.scaling == "well":
+        elif mode == "well":
             lo, hi = well_calib[(ch, pos)]
         else:
             lo, hi = calib[ch]["lo"], calib[ch]["hi"]
-        out, _dt = apply_scale(c, st.scaling, lo or 0, hi or 1)
+        out, _dt = apply_scale(c, mode, lo or 0, hi or 1)
         # Write to a temp name and rename: a half-written file left behind by a
         # drive that vanished mid-write would otherwise look "already done" on
         # the resume pass and never be repaired. Rename is atomic.
@@ -413,6 +468,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "detect_slice": dsl, "detect_channel": dch,
         "centers": {p: list(c) for p, c in centers.items() if c},
         "intensity_calibration": calib,
+        "scaling_modes": modes,
         "settings": st.to_dict(),
     }
     # --- the plate folder, derived from what was actually written ---------
@@ -455,6 +511,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "binning": idx.binning,
         "incubation_temp_c": idx.temperature_C,
         "channel_calibrations": chan_cal,
+        "scaling_modes": modes,
         "fluorescence_calibration": {"channel_calibrations": chan_cal},
         "position_to_well_id": {p: (idx.pos_to_well.get(p) or p)
                                 for p in positions},
@@ -502,7 +559,12 @@ if __name__ == "__main__":
     p.add_argument("--line", default="")
     p.add_argument("--guide", default="")
     p.add_argument("--assay", default="")
-    p.add_argument("--scaling", default="plate", choices=SCALING_MODES)
+    p.add_argument("--scaling", default="plate",
+                   help="one mode for all channels, or a per-channel spec: "
+                        "'plate,CO6=image'. Modes: " + "|".join(SCALING_MODES))
+    p.add_argument("--bf-scaling", default=None,
+                   help="mode for the auto-detected brightfield channel, "
+                        "e.g. --scaling plate --bf-scaling image")
     p.add_argument("--fixed-lo", type=float, default=None,
                    help="low count for --scaling fixed")
     p.add_argument("--fixed-hi", type=float, default=None,
@@ -521,7 +583,8 @@ if __name__ == "__main__":
                  channels=[c for c in a.channels.split(",") if c],
                  positions=[w for w in a.wells.split(",") if w],
                  line=a.line, guide=a.guide, assay=a.assay,
-                 scaling=a.scaling, low_pct=a.low_pct, high_pct=a.high_pct,
+                 scaling=a.scaling, bf_scaling=a.bf_scaling,
+                 low_pct=a.low_pct, high_pct=a.high_pct,
                  fixed_lo=a.fixed_lo, fixed_hi=a.fixed_hi,
                  fov_mm=a.fov_mm, output_px=a.output_px, workers=a.workers,
                  stats_sample=a.stats_sample, overwrite=a.overwrite,

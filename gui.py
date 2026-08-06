@@ -106,7 +106,7 @@ class App:
         f5.pack(fill="x", **pad)
         r = ttk.Frame(f5); r.pack(fill="x", **pad)
         self.scaling = tk.StringVar(value="plate")
-        ttk.Label(r, text="mode").pack(side="left")
+        ttk.Label(r, text="default mode").pack(side="left")
         cb = ttk.Combobox(r, textvariable=self.scaling, width=10,
                           state="readonly", values=list(process.SCALING_MODES))
         cb.pack(side="left", padx=4)
@@ -163,6 +163,8 @@ class App:
         r = ttk.Frame(setup); r.pack(fill="x", **pad)
         ttk.Button(r, text="Save preset", command=self._save).pack(side="left", padx=4)
         ttk.Button(r, text="Load preset", command=self._load).pack(side="left", padx=4)
+        ttk.Button(r, text="Cluster command…",
+                   command=self._show_sbatch).pack(side="left", padx=16)
         ttk.Button(r, text="Add to queue →", command=self._add).pack(side="right", padx=4)
 
         # ---------- queue tab ----------
@@ -226,6 +228,7 @@ class App:
         self._apply_level()
 
     def _checkboxes(self):
+        self.chmodes = {}
         for box, store, items, label in (
                 (self.chbox, self.chvars, self.idx.channels, "channels"),
                 (self.slbox, self.slvars, self.idx.slices, "z-slices")):
@@ -246,6 +249,19 @@ class App:
                 v = tk.BooleanVar(value=True)
                 store[it] = v
                 ttk.Checkbutton(box, text=it, variable=v).pack(side="left", padx=3)
+                # each CHANNEL also gets its own scaling mode: brightfield and
+                # fluorescence want opposite maps and live in the same plate.
+                if store is self.chvars:
+                    dflt = ("image" if it == self.idx.detect_channel else "plate")
+                    m = tk.StringVar(value=dflt)
+                    self.chmodes[it] = m
+                    cb = ttk.Combobox(box, textvariable=m, width=7,
+                                      state="readonly",
+                                      values=list(process.SCALING_MODES))
+                    cb.pack(side="left", padx=(0, 10))
+                    if it == self.idx.detect_channel:
+                        ttk.Label(box, text="(BF)",
+                                  foreground="#777").pack(side="left", padx=(0, 8))
 
     def _selected(self, store, all_items):
         picked = [k for k, v in store.items() if k != "__all__" and v.get()]
@@ -311,7 +327,7 @@ class App:
             fov_mm=self._f(self.fov, acquifer.DEFAULT_FOV_MM),
             output_px=int(self._f(self.outpx, acquifer.DEFAULT_OUTPUT_PX)),
             um_per_px_override=(self._f(self.umpx, 0) or None),
-            scaling=self.scaling.get(),
+            scaling=self._scaling_spec(),
             low_pct=self._f(self.lowp, 1.0), high_pct=self._f(self.highp, 99.9),
             fixed_lo=(self._f(self.flo, 0) or None),
             fixed_hi=(self._f(self.fhi, 0) or None),
@@ -319,6 +335,69 @@ class App:
             dir_template=self.dirt.get(), file_template=self.filet.get(),
             workers=int(self._f(self.workers, 8)),
             overwrite=self.overwrite.get())
+
+    def _scaling_spec(self):
+        """One mode, or "default,CH=mode,..." when channels differ."""
+        modes = getattr(self, "chmodes", {})
+        if not modes:
+            return self.scaling.get()
+        vals = {c: v.get() for c, v in modes.items()}
+        if len(set(vals.values())) == 1:
+            return next(iter(vals.values()))
+        # most common mode becomes the default, the rest are overrides
+        from collections import Counter
+        default = Counter(vals.values()).most_common(1)[0][0]
+        parts = [default] + [f"{c}={m}" for c, m in sorted(vals.items())
+                             if m != default]
+        return ",".join(parts)
+
+    def _sbatch_cmd(self):
+        """The exact cluster command for the settings currently on screen."""
+        s = self._settings()
+        q = lambda v: f"'{v}'" if (" " in str(v) or not str(v)) else str(v)
+        parts = ["sbatch cluster_job.sh", q(s["raw_dir"]), q(s["out_dir"]),
+                 q(s["plate"] or "PLATE"), f"--scaling {q(s['scaling'])}"]
+        if s.get("channels"):
+            parts.append("--channels " + ",".join(s["channels"]))
+        if s.get("positions"):
+            parts.append("--wells " + ",".join(s["positions"]))
+        if s["low_pct"] != 1.0:
+            parts.append(f"--low-pct {s['low_pct']}")
+        if s["high_pct"] != 99.9:
+            parts.append(f"--high-pct {s['high_pct']}")
+        if s.get("fixed_lo") is not None:
+            parts.append(f"--fixed-lo {s['fixed_lo']} --fixed-hi {s['fixed_hi']}")
+        if s["fov_mm"] != acquifer.DEFAULT_FOV_MM:
+            parts.append(f"--fov-mm {s['fov_mm']}")
+        if s["output_px"] != acquifer.DEFAULT_OUTPUT_PX:
+            parts.append(f"--output-px {s['output_px']}")
+        if s["stats_sample"] != 400:
+            parts.append(f"--stats-sample {s['stats_sample']}")
+        if s["overwrite"]:
+            parts.append("--overwrite")
+        cmd = " \\\n    ".join(parts)
+        return (
+            "# The paths below are LOCAL. Edit them to the server paths before\n"
+            "# running -- the cluster cannot see your laptop's drives.\n"
+            "ssh embl\n"
+            "cd /g/aulehla/Tiago/embryo_crop\n"
+            f"{cmd}\n\n"
+            "# --workers comes from --cpus-per-task in cluster_job.sh, so it is\n"
+            "# not passed here. One job, no array: the work is I/O-bound.\n")
+
+    def _show_sbatch(self):
+        w = tk.Toplevel(self.root)
+        w.title("cluster command")
+        w.geometry("880x340")
+        ttk.Label(w, text="Copy this to the cluster. Paths are local — edit them.",
+                  padding=8).pack(anchor="w")
+        t = tk.Text(w, wrap="none", font=("Menlo", 11))
+        t.pack(fill="both", expand=True, padx=8, pady=4)
+        t.insert("1.0", self._sbatch_cmd())
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(t.get("1.0", "end-1c"))
+        ttk.Button(w, text="Copy to clipboard", command=copy).pack(pady=6)
 
     def _save(self):
         os.makedirs(PRESET_DIR, exist_ok=True)

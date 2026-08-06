@@ -119,6 +119,33 @@ between frames — usually fine, because you were not going to measure them.
 `well` sits between the two: it removes the between-well artefact while keeping
 each specimen's time course internally comparable.
 
+### Different modes for different channels
+
+Brightfield and fluorescence usually sit in the *same* plate and want opposite
+maps, so one mode for everything is not enough. `--scaling` therefore takes
+either a single mode or a per-channel spec, and `--bf-scaling` is a shorthand
+for whichever channel was auto-detected as brightfield:
+
+```bash
+# fluorescence comparable across the plate, brightfield auto-contrast
+--scaling plate --bf-scaling image
+
+# the same thing written explicitly
+--scaling plate,CO6=image
+
+# per channel, no default needed
+--scaling CO6=image,CO2=raw16,CO3=plate
+```
+
+The GUI shows a mode dropdown next to every channel, pre-set to `image` for
+the brightfield channel and `plate` for the rest. The resolved map is printed
+at the start of the run and stored as `scaling_modes` in both
+`plate_metadata.json` and the manifest.
+
+Plate statistics are sampled across **every well, timepoint and z-slice** of
+that channel — not just the detection slice. A z-stack is not uniformly bright,
+so percentiles from one slice produce a map that clips or flattens the others.
+
 Whatever you choose is recorded in `plate_metadata.json` along with the
 resulting low/high per channel, so any crop can be traced back — and inverted to
 counts when the map is constant (`raw = value/255 * (hi-lo) + lo`).
@@ -262,8 +289,13 @@ native instead.
 line for your site, then:
 
 ```bash
-sbatch cluster_job.sh RAW_DIR OUT_DIR PLATE --scaling image
+sbatch cluster_job.sh RAW_DIR OUT_DIR PLATE --scaling plate --bf-scaling image
 ```
+
+Every `process.py` flag is passed straight through, and `--workers` comes from
+`--cpus-per-task`. Output directories are created as needed, including the
+whole nested tree — you do not have to pre-make anything. The GUI's **Cluster
+command…** button writes this line for you from the settings on screen.
 
 It submits **one job**, not an array. The work is I/O-bound and detection runs
 a handful of times per well, so nothing here needs many machines — it needs many
