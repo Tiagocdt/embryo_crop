@@ -3,12 +3,9 @@
 #   numpy      arrays, the crop, the rescale, the detector
 #   tifffile   read and write TIFF
 #
-# That is the whole list. Detection is plain numpy, so there is no
-# TensorFlow / PyTorch, no model file to download and no GPU.
-#
-# The GUI additionally needs tkinter, which ships with most Python builds.
-# If `import tkinter` fails, install it from your OS package manager --
-# it is not a pip package. See README.md.
+# The GUI additionally needs tkinter, which ships with most Python builds but is
+# packaged separately by some distributions. It is not a pip package -- see
+# README.md for the per-platform install. The command-line path does not need it.
 #
 # Optional: install `imagecodecs` only if your microscope writes COMPRESSED
 # TIFFs. ACQUIFER frames are uncompressed, so it is not needed by default.
