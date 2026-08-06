@@ -1,0 +1,17 @@
+# embryo_crop needs exactly two third-party packages.
+#
+#   numpy      arrays, the crop, the rescale, the detector
+#   tifffile   read and write TIFF
+#
+# That is the whole list. Detection is plain numpy, so there is no
+# TensorFlow / PyTorch, no model file to download and no GPU.
+#
+# The GUI additionally needs tkinter, which ships with most Python builds.
+# If `import tkinter` fails, install it from your OS package manager --
+# it is not a pip package. See README.md.
+#
+# Optional: install `imagecodecs` only if your microscope writes COMPRESSED
+# TIFFs. ACQUIFER frames are uncompressed, so it is not needed by default.
+
+numpy>=1.24
+tifffile>=2023.1.1

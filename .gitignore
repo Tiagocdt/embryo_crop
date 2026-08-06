@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+
+# saved presets are local paths on someone's machine -- example.json is the
+# only one that belongs in the repo
+presets/*.json
+!presets/example.json
+
+# never commit data or outputs
+*.tif
+*_manifest.json
+plate_metadata.json

@@ -1,0 +1,21 @@
+{
+  "raw_dir": "/path/to/raw/20241206_V03",
+  "out_dir": "/path/to/output/PROCESSED",
+  "plate": "V03",
+  "channels": [],
+  "slices": [],
+  "positions": [],
+  "fov_mm": 1.872,
+  "output_px": 576,
+  "um_per_px_override": null,
+  "scaling": "image",
+  "low_pct": 1.0,
+  "high_pct": 99.9,
+  "fixed_lo": null,
+  "fixed_hi": null,
+  "stats_sample": 400,
+  "dir_template": "{plate}/{channel}/{pos}/{slice}",
+  "file_template": "{plate}_{pos}_LO{tp:03d}_{channel}_{slice}.tif",
+  "workers": 8,
+  "overwrite": false
+}
