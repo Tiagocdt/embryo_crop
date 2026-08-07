@@ -51,6 +51,26 @@ HIST_BINS = 65536
 IO_ATTEMPTS = 4
 IO_BACKOFF = 1.5
 
+# A frame can be unreadable for two different reasons and they need different
+# treatment. A vanished mount raises OSError and IS worth retrying. A file the
+# microscope failed to write is zero bytes forever -- tifffile raises
+# TiffFileError("not a TIFF file: header=b''"), retrying is pointless, and
+# crucially TiffFileError is NOT an OSError, so it escapes the retry guard and
+# would abort the whole plate. Roughly 1% of frames on some ACQUIFER runs are
+# zero-byte, so a plate MUST survive them.
+UNREADABLE = (tifffile.TiffFileError, ValueError)
+
+
+def read_frame(path):
+    """Read one raw frame. Transient I/O is retried; a corrupt/empty file is
+    raised straight away because no amount of retrying will fix it."""
+    try:
+        return _retry(tifffile.imread, path)
+    except UNREADABLE:
+        raise
+    except OSError:
+        raise
+
 
 def _retry(fn, *a, **kw):
     last = None
@@ -246,11 +266,21 @@ def compute_calibration(idx, st, channel, mode, log=print):
     t0 = time.perf_counter()
 
     def rd(k):
-        return tifffile.imread(os.path.join(idx.image_dir, idx.frames[k][2]))
+        try:
+            return read_frame(os.path.join(idx.image_dir, idx.frames[k][2]))
+        except (OSError,) + UNREADABLE:
+            return None                      # zero-byte frame: not in the stats
 
+    n_bad = 0
     with ThreadPoolExecutor(max_workers=st.workers) as ex:
         for img in ex.map(rd, keys):
+            if img is None:
+                n_bad += 1
+                continue
             accumulate(hist, img)
+    if n_bad:
+        log(f"  {channel}: {n_bad}/{len(keys)} sampled frames unreadable "
+            f"(zero-byte); excluded from the statistics")
     lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
     log(f"  {channel}: plate calibration from {len(keys)} frames in "
         f"{time.perf_counter()-t0:.1f}s -> "
@@ -332,14 +362,29 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
     dch, dsl = idx.detect_channel, idx.detect_slice
     tps = idx.timepoints
     probe_tps = [tps[0], tps[len(tps) // 2], tps[-1]] if len(tps) > 2 else tps
+    # spares to fall back on when a probe frame turns out to be unreadable
+    MAX_DETECT_TRIES = 12
+    extra_tps = [tps[int(len(tps) * f)] for f in
+                 (0.1, 0.25, 0.4, 0.6, 0.75, 0.9)] if len(tps) > 10 else []
 
     def det(pos):
-        pts = []
-        for tp in probe_tps:
+        """Median centre from a few probe frames. Unreadable frames are skipped
+        and further timepoints tried, so a handful of zero-byte files cannot
+        cost the whole well -- let alone the whole plate."""
+        pts, tried, bad = [], 0, 0
+        for tp in probe_tps + extra_tps:
+            if len(pts) >= len(probe_tps) or tried >= MAX_DETECT_TRIES:
+                break
             k = (pos, tp, dch, dsl)
-            if k in idx.frames:
-                img = tifffile.imread(os.path.join(idx.image_dir, idx.frames[k][2]))
-                pts.append(detect_center(img))
+            if k not in idx.frames:
+                continue
+            tried += 1
+            try:
+                img = read_frame(os.path.join(idx.image_dir, idx.frames[k][2]))
+            except (OSError,) + UNREADABLE:
+                bad += 1
+                continue
+            pts.append(detect_center(img))
         if not pts:
             return pos, None
         return pos, (int(np.median([p[0] for p in pts])),
@@ -400,9 +445,9 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             skipped[0] += 1
             return
         try:
-            img = _retry(tifffile.imread, os.path.join(idx.image_dir, fname))
-        except (OSError, ValueError) as e:
-            failed.append((str(k), f"read: {e}"))
+            img = read_frame(os.path.join(idx.image_dir, fname))
+        except (OSError,) + UNREADABLE as e:
+            failed.append((str(k), f"read: {type(e).__name__}: {e}"))
             return
         cy, cx = centers[pos]
         c, _fill = crop_at(img, cy, cx, crop_px)
@@ -425,8 +470,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             tmp = dst + ".part"
             _retry(tifffile.imwrite, tmp, out)
             _retry(os.replace, tmp, dst)
-        except (OSError, ValueError) as e:
-            failed.append((str(k), f"write: {e}"))
+        except (OSError,) + UNREADABLE as e:
+            failed.append((str(k), f"write: {type(e).__name__}: {e}"))
             return
         written[0] += 1
 
@@ -445,6 +490,11 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         progress(done[0], total, "done")
 
     dt = time.perf_counter() - t0
+    n_corrupt = sum(1 for _k, why in failed if "TiffFileError" in why)
+    if n_corrupt:
+        log(f"  {n_corrupt} frame(s) were UNREADABLE (zero-byte raw files the "
+            f"microscope never finished writing). They are skipped, not "
+            f"retried; every other frame was processed.")
     if failed:
         log(f"  {len(failed)} frame(s) FAILED after {IO_ATTEMPTS} attempts "
             f"(drive dropped?). Re-run the same command to fill them in — "
@@ -457,7 +507,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "raw_dir": idx.image_dir,
         "out_dir": st.out_dir,
         "n_written": written[0], "n_skipped": skipped[0],
-        "n_failed": len(failed), "failed": failed[:200],
+        "n_failed": len(failed), "n_unreadable": n_corrupt,
+        "failed": failed[:200],
         "seconds": round(dt, 1),
         "files_per_sec": round(written[0] / dt, 1) if dt else None,
         "raw_frame": list(idx.frame_shape) if idx.frame_shape else None,
