@@ -411,6 +411,24 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
     if not um:
         raise RuntimeError("pixel size unknown; set the objective override")
     crop_px = int(round(st.fov_mm * 1000.0 / um))
+
+    # A crop can never be larger than the frame it is cut from. If it is, the
+    # pixel size is wrong -- almost always a bad PX token in the filenames --
+    # and every output would be a small embryo adrift in black padding. Refuse
+    # rather than write hundreds of thousands of unusable files.
+    #
+    # Real example: AQV02/AQV03 carry PX01625 (162.5 nm) where every other
+    # plate from the same microscope carries PX16250 (1625 nm). That is a 10x
+    # error, giving um/px 0.325 and a 5760 px crop on a 1024 px frame.
+    if idx.frame_shape and crop_px > min(idx.frame_shape[:2]):
+        raise RuntimeError(
+            f"crop of {crop_px}px does not fit in a "
+            f"{idx.frame_shape[1]}x{idx.frame_shape[0]} frame.\n"
+            f"  um/px was derived as {um} from PX={idx.px_sensor_nm}nm x "
+            f"binning {idx.binning}.\n"
+            f"  That pixel size is almost certainly wrong in the filenames.\n"
+            f"  Override it, e.g.  --um-per-px 3.25   (or set --fov-mm smaller "
+            f"if the crop really should be this large).")
     channels = st.channels or idx.channels
     slices = st.slices or idx.slices
     positions = st.positions or idx.positions
@@ -696,6 +714,9 @@ if __name__ == "__main__":
     p.add_argument("--scaling", default="plate",
                    help="one mode for all channels, or a per-channel spec: "
                         "'plate,CO6=image'. Modes: " + "|".join(SCALING_MODES))
+    p.add_argument("--um-per-px", type=float, default=None,
+                   help="override the pixel size when the PX token in the "
+                        "filenames is wrong")
     p.add_argument("--egg-mm", type=float, default=None,
                    help=f"specimen diameter in mm (default {EGG_MM}); sets the "
                         "detection smoothing radius")
@@ -724,5 +745,6 @@ if __name__ == "__main__":
                  low_pct=a.low_pct, high_pct=a.high_pct,
                  fixed_lo=a.fixed_lo, fixed_hi=a.fixed_hi,
                  fov_mm=a.fov_mm, output_px=a.output_px, workers=a.workers,
+                 um_per_px_override=a.um_per_px,
                  stats_sample=a.stats_sample, overwrite=a.overwrite,
                  metadata_only=a.metadata_only))
