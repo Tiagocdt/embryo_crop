@@ -183,7 +183,11 @@ def crop_at(img, cy, cx, size, clamp=True):
     if sy1 > sy0 and sx1 > sx0:
         out[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
     filled = ((sy1 - sy0) * (sx1 - sx0)) / float(size * size)
-    return out, filled
+    # where the REAL image sits inside the crop. Any statistic taken over the
+    # crop must be restricted to this window, or the black padding counts as
+    # the darkest pixels present -- see the per-image scaling in run().
+    valid = (sy0 - y0, sy1 - y0, sx0 - x0, sx1 - x0)
+    return out, filled, valid
 
 
 def resize(a, out_px):
