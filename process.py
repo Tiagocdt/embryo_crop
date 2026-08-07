@@ -294,6 +294,10 @@ class Settings:
         # calibration are deterministic, so the values match the run
         # that produced the crops.
         self.metadata_only = bool(kw.get("metadata_only", False))
+        # Reuse the detected centres from a previous run's plate_metadata.json
+        # instead of re-detecting. Lets one channel be re-rendered without
+        # touching the others and without any risk of the crop moving.
+        self.reuse_centers = bool(kw.get("reuse_centers", False))
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -314,7 +318,8 @@ def _sample_frames(idx, channel, n):
     return [keys[int(i * step)] for i in range(n)]
 
 
-def compute_calibration(idx, st, channel, mode, log=print):
+def compute_calibration(idx, st, channel, mode, log=print, centers=None,
+                        crop_px=None):
     """One LO/HI for `channel`, over the scope `mode` asks for."""
     if mode == "raw16":
         return {"mode": "raw16", "lo": None, "hi": None}
@@ -333,11 +338,24 @@ def compute_calibration(idx, st, channel, mode, log=print):
     hist = np.zeros(HIST_BINS, dtype=np.int64)
     t0 = time.perf_counter()
 
+    # Accumulate over the CROP REGION, not the whole frame. A raw frame is
+    # mostly empty well: its median pixel is background, so a percentile taken
+    # over whole frames is set by background and the specimen's bright interior
+    # clips. "0.1% of all pixels" is a far harder cut than "0.1% of the pixels
+    # actually written". Measured on a 2-channel plate: p99.9 over frames =
+    # 12243, over crops = 21308, and the worst well's clipping inside the crop
+    # fell from 3.9% to 2.2% with the p90 well going from 0.42% to 0.00%.
+    half = (crop_px // 2) if crop_px else None
+
     def rd(k):
         try:
-            return read_frame(os.path.join(idx.image_dir, idx.frames[k][2]))
+            a = read_frame(os.path.join(idx.image_dir, idx.frames[k][2]))
         except (OSError,) + UNREADABLE:
             return None                      # zero-byte frame: not in the stats
+        if half and centers and centers.get(k[0]):
+            cy, cx = centers[k[0]]
+            a = a[max(0, cy - half):cy + half, max(0, cx - half):cx + half]
+        return a
 
     n_bad = 0
     with ThreadPoolExecutor(max_workers=st.workers) as ex:
@@ -350,10 +368,11 @@ def compute_calibration(idx, st, channel, mode, log=print):
         log(f"  {channel}: {n_bad}/{len(keys)} sampled frames unreadable "
             f"(zero-byte); excluded from the statistics")
     lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
-    log(f"  {channel}: plate calibration from {len(keys)} frames in "
+    scope = "crop regions" if (half and centers) else "whole frames"
+    log(f"  {channel}: plate calibration from {len(keys)} {scope} in "
         f"{time.perf_counter()-t0:.1f}s -> "
         f"p{st.low_pct}={lo:.0f}  p{st.high_pct}={hi:.0f}")
-    return {"mode": "plate", "lo": lo, "hi": hi,
+    return {"mode": "plate", "lo": lo, "hi": hi, "scope": scope,
             "low_pct": st.low_pct, "high_pct": st.high_pct,
             "n_frames_sampled": len(keys),
             "sampled_all": st.stats_sample <= 0 or len(keys) == len(idx.frames)}
@@ -443,8 +462,33 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         log(f"  scaling {ch} = {modes[ch]}{tag}")
 
     # --- 3. detect once per well, on the detect slice/channel -----------
-    log("detecting embryos ...")
+    # --- reuse centres from a previous run, if asked ---------------------
     centers = {}
+    reused = False
+    if st.reuse_centers:
+        prev = os.path.join(st.out_dir, plate, "plate_metadata.json")
+        if not os.path.exists(prev):
+            raise RuntimeError(
+                f"--reuse-centers needs a previous run's metadata at {prev}, "
+                f"and there is none. Run once without it first.")
+        pm = json.load(open(prev))
+        for p, v in (pm.get("positions") or {}).items():
+            c = v.get("center_yx")
+            if c:
+                centers[p] = (int(c[0]), int(c[1]))
+        if not centers:
+            raise RuntimeError(f"{prev} holds no centres to reuse.")
+        reused = True
+        log(f"reusing {len(centers)} centres from {prev} (no re-detection)")
+        prev_crop = pm.get("crop_size")
+        if prev_crop and prev_crop != crop_px:
+            raise RuntimeError(
+                f"previous run used crop {prev_crop}px, this one derives "
+                f"{crop_px}px. Reusing centres across a different crop would "
+                f"silently reframe every image; pass --um-per-px / --fov-mm to "
+                f"match, or drop --reuse-centers.")
+
+    log("detecting embryos ..." if not reused else "detection skipped")
     dch, dsl = idx.detect_channel, idx.detect_slice
     tps = idx.timepoints
     probe_tps = [tps[0], tps[len(tps) // 2], tps[-1]] if len(tps) > 2 else tps
@@ -476,18 +520,20 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         return pos, (int(np.median([p[0] for p in pts])),
                      int(np.median([p[1] for p in pts])))
 
-    with ThreadPoolExecutor(max_workers=st.workers) as ex:
-        for i, (pos, c) in enumerate(ex.map(det, positions)):
-            centers[pos] = c
-            if progress:
-                progress(i + 1, len(positions), f"detect {pos}")
+    if not reused:
+        with ThreadPoolExecutor(max_workers=st.workers) as ex:
+            for i, (pos, c) in enumerate(ex.map(det, positions)):
+                centers[pos] = c
+                if progress:
+                    progress(i + 1, len(positions), f"detect {pos}")
     bad = [p for p, c in centers.items() if c is None]
     if bad:
         log(f"  WARNING: no detection for {bad}")
 
     # --- 6a. calibration per channel ------------------------------------
     log("computing intensity calibration ...")
-    calib = {ch: compute_calibration(idx, st, ch, modes[ch], log)
+    calib = {ch: compute_calibration(idx, st, ch, modes[ch], log,
+                                     centers=centers, crop_px=crop_px)
              for ch in channels}
 
     # per-well calibration if that is the chosen scope
@@ -537,15 +583,21 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             failed.append((str(k), f"read: {type(e).__name__}: {e}"))
             return
         cy, cx = centers[pos]
-        c, f = crop_at(img, cy, cx, crop_px)
+        c, f, valid = crop_at(img, cy, cx, crop_px)
         # keep the WORST fill seen for this well; a perfect 1.0 must still be
         # recorded, so every well appears in the manifest
         fill[pos] = min(fill.get(pos, 1.0), f)
+        # Per-image percentiles must come from REAL PIXELS ONLY. Padding is
+        # exact zeros, so including it would make it the low percentile:
+        # p_low collapses toward 0 and the content is squeezed into a fraction
+        # of the output range -- flat and washed out. Taken before the resize,
+        # where the valid window is known exactly.
+        content = c if f >= 1.0 else c[valid[0]:valid[1], valid[2]:valid[3]]
         c = resize(c, st.output_px)
         mode = modes[ch]
         if mode == "image":
             lo, hi = percentiles_from_hist(
-                accumulate(np.zeros(HIST_BINS, dtype=np.int64), c),
+                accumulate(np.zeros(HIST_BINS, dtype=np.int64), content),
                 [st.low_pct, st.high_pct])
         elif mode == "well":
             lo, hi = well_calib[(ch, pos)]
@@ -734,6 +786,9 @@ if __name__ == "__main__":
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--stats-sample", type=int, default=400)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--reuse-centers", action="store_true",
+                   help="take crop centres from a previous run's "
+                        "plate_metadata.json instead of re-detecting")
     p.add_argument("--metadata-only", action="store_true",
                    help="only (re)write plate_metadata.json; touch no images")
     a = p.parse_args()
@@ -747,4 +802,5 @@ if __name__ == "__main__":
                  fov_mm=a.fov_mm, output_px=a.output_px, workers=a.workers,
                  um_per_px_override=a.um_per_px,
                  stats_sample=a.stats_sample, overwrite=a.overwrite,
-                 metadata_only=a.metadata_only))
+                 metadata_only=a.metadata_only,
+                 reuse_centers=a.reuse_centers))
