@@ -102,9 +102,23 @@ def _box(a, r):
             - ii[k:k + n, 0:m] + ii[0:n, 0:m]) / (k * k)
 
 
-# A medaka egg is about this across. It is a PHYSICAL size, so the smoothing
-# radius must be derived from um/px -- see detect_center().
-EGG_MM = 1.5
+# How big the specimen is, in millimetres. This is a PHYSICAL size, so the
+# smoothing radius is derived from it and um/px -- see detect_center().
+#
+# MEASURED, not guessed: the chorion of a medaka egg came out at 1.69 mm on
+# 1024px binned EMBL frames and 1.61 mm on 2048px unbinned Wittbrodt frames
+# (radial gradient profile taken about the reference centres in both).
+#
+# It does not need to be exact. Sweeping it against 40 reference centres, every
+# value from 1.5 to 1.8 mm placed all wells within half an egg-radius; the
+# default sits in the middle of that plateau rather than at its edge:
+#
+#     egg_mm   1.00  1.25  1.50  1.65  1.80  2.00  2.50
+#     median    130    69    30    26    28    46    68   px error
+#     >57px      40    26     0     0     0    10    23   wells
+#
+# For a different species, set --egg-mm instead of editing this.
+EGG_MM = 1.65
 
 
 def detect_center(img, um_per_px=None, downsample=4, egg_mm=EGG_MM,
@@ -141,12 +155,26 @@ def detect_center(img, um_per_px=None, downsample=4, egg_mm=EGG_MM,
 # ---------------------------------------------------------------------------
 # 4. crop  /  5. resize
 # ---------------------------------------------------------------------------
-def crop_at(img, cy, cx, size):
-    """Cut `size` x `size` centred on (cy, cx). If the window runs off the
-    frame the missing part is left black -- the field of view is never shrunk
-    to make it fit. Returns (crop, fill_fraction)."""
+def crop_at(img, cy, cx, size, clamp=True):
+    """Cut `size` x `size` centred on (cy, cx). Returns (crop, fill_fraction).
+
+    If the window would run off the frame it is SHIFTED back inside rather than
+    padded with black (`clamp`). The specimen is smaller than the crop -- an egg
+    is ~519 px inside a 576 px window -- so sliding the window a few dozen
+    pixels keeps the whole specimen visible, whereas padding throws away real
+    image and then poisons any per-image contrast stretch with a slab of zeros.
+    The field of view is never shrunk; only its position moves.
+
+    Black padding still happens when the frame itself is smaller than the crop,
+    which is the one case shifting cannot fix.
+    """
     h, w = img.shape[:2]
     half = size // 2
+    if clamp:
+        if size <= h:
+            cy = min(max(cy, half), h - (size - half))
+        if size <= w:
+            cx = min(max(cx, half), w - (size - half))
     y0, y1 = cy - half, cy - half + size
     x0, x1 = cx - half, cx - half + size
     out = np.zeros((size, size), dtype=img.dtype)
@@ -221,6 +249,8 @@ class Settings:
         self.scaling = kw.get("scaling", "plate")
         # convenience: mode for whichever channel is brightfield
         self.bf_scaling = kw.get("bf_scaling") or None
+        # specimen size in mm; sets the detection smoothing radius
+        self.egg_mm = float(kw.get("egg_mm") or EGG_MM)
         self.low_pct = float(kw.get("low_pct", 1.0))
         self.high_pct = float(kw.get("high_pct", 99.9))
         self.fixed_lo = kw.get("fixed_lo")
@@ -403,7 +433,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             except (OSError,) + UNREADABLE:
                 bad += 1
                 continue
-            pts.append(detect_center(img, um_per_px=um))
+            pts.append(detect_center(img, um_per_px=um, egg_mm=st.egg_mm))
         if not pts:
             return pos, None
         return pos, (int(np.median([p[0] for p in pts])),
@@ -547,6 +577,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "binning": idx.binning, "binning_reason": idx.binning_reason,
         "px_sensor_nm": idx.px_sensor_nm, "um_per_px": um,
         "fov_mm": st.fov_mm, "crop_px": crop_px, "output_px": st.output_px,
+        "egg_mm": st.egg_mm,
         "temperature_C": idx.temperature_C,
         "detect_slice": dsl, "detect_channel": dch,
         "centers": {p: list(c) for p, c in centers.items() if c},
@@ -646,6 +677,9 @@ if __name__ == "__main__":
     p.add_argument("--scaling", default="plate",
                    help="one mode for all channels, or a per-channel spec: "
                         "'plate,CO6=image'. Modes: " + "|".join(SCALING_MODES))
+    p.add_argument("--egg-mm", type=float, default=None,
+                   help=f"specimen diameter in mm (default {EGG_MM}); sets the "
+                        "detection smoothing radius")
     p.add_argument("--bf-scaling", default=None,
                    help="mode for the auto-detected brightfield channel, "
                         "e.g. --scaling plate --bf-scaling image")
@@ -667,7 +701,7 @@ if __name__ == "__main__":
                  channels=[c for c in a.channels.split(",") if c],
                  positions=[w for w in a.wells.split(",") if w],
                  line=a.line, guide=a.guide, assay=a.assay,
-                 scaling=a.scaling, bf_scaling=a.bf_scaling,
+                 scaling=a.scaling, bf_scaling=a.bf_scaling, egg_mm=a.egg_mm,
                  low_pct=a.low_pct, high_pct=a.high_pct,
                  fixed_lo=a.fixed_lo, fixed_hi=a.fixed_hi,
                  fov_mm=a.fov_mm, output_px=a.output_px, workers=a.workers,
