@@ -187,11 +187,26 @@ def crop_at(img, cy, cx, size, clamp=True):
 
 
 def resize(a, out_px):
-    """Bilinear resize. Used only when the optics differ from the reference
-    (e.g. a 2x objective gives a 288 px crop that must become 576)."""
+    """Resample a square crop to `out_px`.
+
+    DOWNSAMPLING AREA-AVERAGES. Point-sampling a reduction throws away every
+    pixel it does not land on, so fine detail folds back as aliasing -- moire on
+    the chorion, jagged edges, and noise that survives where it should have
+    averaged out. This matters for higher-resolution optics: a 4x unbinned
+    acquisition yields a 1152 px crop that must become 576, where a 2x-binned
+    one yields 576 and never resamples at all. Same nominal pipeline, but only
+    the sharper data goes through this path -- so it has to be the good one.
+
+    Integer reductions are a block mean; anything else falls back to bilinear.
+    """
     if a.shape[0] == out_px and a.shape[1] == out_px:
         return a
     n = a.shape[0]
+    if n > out_px and n % out_px == 0:
+        k = n // out_px
+        return (a.reshape(out_px, k, out_px, k)
+                 .mean(axis=(1, 3))
+                 .astype(a.dtype))
     idx = np.linspace(0, n - 1, out_px)
     i0 = np.floor(idx).astype(int)
     i1 = np.minimum(i0 + 1, n - 1)
