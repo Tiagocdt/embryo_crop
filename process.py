@@ -102,18 +102,37 @@ def _box(a, r):
             - ii[k:k + n, 0:m] + ii[0:n, 0:m]) / (k * k)
 
 
-def detect_center(img, downsample=4, egg_frac=0.23):
+# A medaka egg is about this across. It is a PHYSICAL size, so the smoothing
+# radius must be derived from um/px -- see detect_center().
+EGG_MM = 1.5
+
+
+def detect_center(img, um_per_px=None, downsample=4, egg_mm=EGG_MM,
+                  egg_frac=None):
     """(cy, cx) of the embryo, in full-resolution pixels.
 
     The egg is the only textured object in an otherwise flat well, so its
     centre is the peak of gradient energy smoothed over about an egg radius.
-    Validated against EmbryoNet on all 96 wells of Wittbrodt V01:
-    median error 9 px, worst 28 px on a 2048 px frame (the egg is ~480 px
-    across and the crop 576) -- see README.md.
+
+    THE RADIUS MUST COME FROM um/px, NOT FROM A FRACTION OF THE FRAME. An egg
+    is ~1.5 mm however you image it; at 3.25 um/px that is 462 px, which is 23%
+    of a 2048 px frame but 45% of a 1024 px one. A fixed fraction therefore
+    smooths over half the correct radius on the smaller frame, and the argmax
+    settles on a sub-feature instead of the whole egg -- centres drift toward
+    one edge and the crop runs off the frame. `egg_frac` is kept only as a
+    manual override for data whose pixel size is unknown.
+
+    Validated against EmbryoNet on all 96 wells of Wittbrodt V01: median error
+    9 px, worst 28 px on a 2048 px frame -- see README.md.
     """
     small = img[::downsample, ::downsample].astype(np.float32)
+    if egg_frac is not None:
+        r = max(1, int(egg_frac * small.shape[0] / 2))
+    elif um_per_px:
+        r = max(1, int((egg_mm * 1000.0 / um_per_px) / 2 / downsample))
+    else:
+        r = max(1, int(0.23 * small.shape[0] / 2))      # last-resort guess
     gy, gx = np.gradient(small)
-    r = max(1, int(egg_frac * small.shape[0] / 2))
     smoothed = _box(np.hypot(gy, gx), r)
     cy, cx = np.unravel_index(np.argmax(smoothed), smoothed.shape)
     return int(cy * downsample), int(cx * downsample)
@@ -384,7 +403,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             except (OSError,) + UNREADABLE:
                 bad += 1
                 continue
-            pts.append(detect_center(img))
+            pts.append(detect_center(img, um_per_px=um))
         if not pts:
             return pos, None
         return pos, (int(np.median([p[0] for p in pts])),
@@ -431,6 +450,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
     written = [0]
     skipped = [0]
     failed = []
+    fill = {}          # pos -> smallest fraction of the crop that is real image
     t0 = time.perf_counter()
 
     def one(k):
@@ -450,7 +470,10 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             failed.append((str(k), f"read: {type(e).__name__}: {e}"))
             return
         cy, cx = centers[pos]
-        c, _fill = crop_at(img, cy, cx, crop_px)
+        c, f = crop_at(img, cy, cx, crop_px)
+        # keep the WORST fill seen for this well; a perfect 1.0 must still be
+        # recorded, so every well appears in the manifest
+        fill[pos] = min(fill.get(pos, 1.0), f)
         c = resize(c, st.output_px)
         mode = modes[ch]
         if mode == "image":
@@ -490,6 +513,13 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         progress(done[0], total, "done")
 
     dt = time.perf_counter() - t0
+    off = {p: round(f, 3) for p, f in fill.items() if f < 0.995}
+    if off:
+        log(f"  WARNING: {len(off)} well(s) have a crop running OFF the frame — "
+            f"the detected centre is closer to an edge than half the crop, so "
+            f"part of the image is black padding:")
+        for p, f in sorted(off.items(), key=lambda kv: kv[1])[:8]:
+            log(f"    {p}: only {f*100:.0f}% of the crop is real image")
     n_corrupt = sum(1 for _k, why in failed if "TiffFileError" in why)
     if n_corrupt:
         log(f"  {n_corrupt} frame(s) were UNREADABLE (zero-byte raw files the "
@@ -508,6 +538,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "out_dir": st.out_dir,
         "n_written": written[0], "n_skipped": skipped[0],
         "n_failed": len(failed), "n_unreadable": n_corrupt,
+        "crop_fill_frac": {p: round(f, 4) for p, f in sorted(fill.items())},
+        "wells_cropping_off_frame": sorted(off),
         "failed": failed[:200],
         "seconds": round(dt, 1),
         "files_per_sec": round(written[0] / dt, 1) if dt else None,
@@ -569,7 +601,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "positions": {p: {"plate_position": p,
                           "well_id": idx.pos_to_well.get(p) or p,
                           "status": "ok" if centers.get(p) else "no_detection",
-                          "center_yx": list(centers[p]) if centers.get(p) else None}
+                          "center_yx": list(centers[p]) if centers.get(p) else None,
+                          "crop_fill_frac": round(fill.get(p, 1.0), 4)}
                       for p in positions},
     }
     if idx.interval_min:
