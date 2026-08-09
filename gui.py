@@ -163,8 +163,6 @@ class App:
         r = ttk.Frame(setup); r.pack(fill="x", **pad)
         ttk.Button(r, text="Save preset", command=self._save).pack(side="left", padx=4)
         ttk.Button(r, text="Load preset", command=self._load).pack(side="left", padx=4)
-        ttk.Button(r, text="Cluster command…",
-                   command=self._show_sbatch).pack(side="left", padx=16)
         ttk.Button(r, text="Add to queue →", command=self._add).pack(side="right", padx=4)
 
         # ---------- queue tab ----------
@@ -350,54 +348,6 @@ class App:
         parts = [default] + [f"{c}={m}" for c, m in sorted(vals.items())
                              if m != default]
         return ",".join(parts)
-
-    def _sbatch_cmd(self):
-        """The exact cluster command for the settings currently on screen."""
-        s = self._settings()
-        q = lambda v: f"'{v}'" if (" " in str(v) or not str(v)) else str(v)
-        parts = ["sbatch cluster_job.sh", q(s["raw_dir"]), q(s["out_dir"]),
-                 q(s["plate"] or "PLATE"), f"--scaling {q(s['scaling'])}"]
-        if s.get("channels"):
-            parts.append("--channels " + ",".join(s["channels"]))
-        if s.get("positions"):
-            parts.append("--wells " + ",".join(s["positions"]))
-        if s["low_pct"] != 1.0:
-            parts.append(f"--low-pct {s['low_pct']}")
-        if s["high_pct"] != 99.9:
-            parts.append(f"--high-pct {s['high_pct']}")
-        if s.get("fixed_lo") is not None:
-            parts.append(f"--fixed-lo {s['fixed_lo']} --fixed-hi {s['fixed_hi']}")
-        if s["fov_mm"] != acquifer.DEFAULT_FOV_MM:
-            parts.append(f"--fov-mm {s['fov_mm']}")
-        if s["output_px"] != acquifer.DEFAULT_OUTPUT_PX:
-            parts.append(f"--output-px {s['output_px']}")
-        if s["stats_sample"] != 400:
-            parts.append(f"--stats-sample {s['stats_sample']}")
-        if s["overwrite"]:
-            parts.append("--overwrite")
-        cmd = " \\\n    ".join(parts)
-        return (
-            "# The paths below are LOCAL. Edit them to the server paths before\n"
-            "# running -- the cluster cannot see your laptop's drives.\n"
-            "ssh embl\n"
-            "cd /g/aulehla/Tiago/embryo_crop\n"
-            f"{cmd}\n\n"
-            "# --workers comes from --cpus-per-task in cluster_job.sh, so it is\n"
-            "# not passed here. One job, no array: the work is I/O-bound.\n")
-
-    def _show_sbatch(self):
-        w = tk.Toplevel(self.root)
-        w.title("cluster command")
-        w.geometry("880x340")
-        ttk.Label(w, text="Copy this to the cluster. Paths are local — edit them.",
-                  padding=8).pack(anchor="w")
-        t = tk.Text(w, wrap="none", font=("Menlo", 11))
-        t.pack(fill="both", expand=True, padx=8, pady=4)
-        t.insert("1.0", self._sbatch_cmd())
-        def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(t.get("1.0", "end-1c"))
-        ttk.Button(w, text="Copy to clipboard", command=copy).pack(pady=6)
 
     def _save(self):
         os.makedirs(PRESET_DIR, exist_ok=True)

@@ -39,7 +39,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import tifffile
 
-from acquifer import DEFAULT_FOV_MM, DEFAULT_OUTPUT_PX, index_folder
+from acquifer import (DEFAULT_FOV_MM, DEFAULT_OUTPUT_PX, find_image_dirs,
+                      index_folder, index_folders)
 
 SCALING_MODES = ("plate", "well", "image", "fixed", "raw16")
 HIST_BINS = 65536
@@ -298,6 +299,9 @@ class Settings:
         # instead of re-detecting. Lets one channel be re-rendered without
         # touching the others and without any risk of the crop moving.
         self.reuse_centers = bool(kw.get("reuse_centers", False))
+        # Join several image folders under one raw dir into a continuous
+        # series -- an acquisition that was stopped and restarted.
+        self.merge_runs = bool(kw.get("merge_runs", False))
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -349,7 +353,7 @@ def compute_calibration(idx, st, channel, mode, log=print, centers=None,
 
     def rd(k):
         try:
-            a = read_frame(os.path.join(idx.image_dir, idx.frames[k][2]))
+            a = read_frame(idx.path(k))
         except (OSError,) + UNREADABLE:
             return None                      # zero-byte frame: not in the stats
         if half and centers and centers.get(k[0]):
@@ -424,7 +428,15 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
     """Process one plate. `progress(done, total, message)` drives the GUI."""
     t_start = time.perf_counter()
     log(f"indexing {st.raw_dir} ...")
-    idx = index_folder(st.raw_dir)
+    if st.merge_runs:
+        dirs = find_image_dirs(st.raw_dir)
+        if len(dirs) > 1:
+            log(f"merging {len(dirs)} runs into one continuous series:")
+            for d in dirs:
+                log(f"    {d}")
+        idx = index_folders(dirs)
+    else:
+        idx = index_folder(st.raw_dir)
     plate = st.plate or os.path.basename(os.path.normpath(st.raw_dir))
     um = st.um_per_px_override or idx.um_per_px
     if not um:
@@ -510,7 +522,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                 continue
             tried += 1
             try:
-                img = read_frame(os.path.join(idx.image_dir, idx.frames[k][2]))
+                img = read_frame(idx.path(k))
             except (OSError,) + UNREADABLE:
                 bad += 1
                 continue
@@ -546,7 +558,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                 hist = np.zeros(HIST_BINS, dtype=np.int64)
                 for k in sorted(keys)[:60]:
                     accumulate(hist, tifffile.imread(
-                        os.path.join(idx.image_dir, idx.frames[k][2])))
+                        idx.path(k)))
                 lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
                 well_calib[(ch, pos)] = (lo, hi)
 
@@ -578,7 +590,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             skipped[0] += 1
             return
         try:
-            img = read_frame(os.path.join(idx.image_dir, fname))
+            img = read_frame(idx.path(k))
         except (OSError,) + UNREADABLE as e:
             failed.append((str(k), f"read: {type(e).__name__}: {e}"))
             return
@@ -669,6 +681,10 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "egg_mm": st.egg_mm,
         "temperature_C": idx.temperature_C,
         "detect_slice": dsl, "detect_channel": dch,
+        "segments": idx.segments,
+        "source_dirs": idx.source_dirs,
+        "tp_minutes": idx.tp_minutes,
+        "tp_time_ms": idx.tp_time_ms,
         "centers": {p: list(c) for p, c in centers.items() if c},
         "intensity_calibration": calib,
         "scaling_modes": modes,
@@ -708,6 +724,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "output_size": st.output_px,
         "detect_slice": dsl,
         "bf_channel": dch,
+        "segments": idx.segments,
+        "tp_minutes": idx.tp_minutes,
         "channels": channels,
         "z_slices": slices,
         "um_per_px": um,
@@ -733,6 +751,27 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
 
     os.makedirs(plate_dir, exist_ok=True)
     ppath = os.path.join(plate_dir, "plate_metadata.json")
+    # MERGE with any existing metadata rather than replacing it. A run
+    # restricted to one channel (--channels CO3) would otherwise rewrite the
+    # file as if the plate had only that channel, discarding how the others
+    # were scaled while their images sit untouched on disk.
+    if os.path.exists(ppath):
+        try:
+            prev_meta = json.load(open(ppath))
+        except (OSError, ValueError):
+            prev_meta = {}
+        for key in ("channel_calibrations", "scaling_modes"):
+            merged_key = dict(prev_meta.get(key) or {})
+            merged_key.update(plate_meta.get(key) or {})
+            plate_meta[key] = merged_key
+        plate_meta["channels"] = sorted(
+            set(prev_meta.get("channels") or []) | set(plate_meta.get("channels") or []),
+            key=lambda c: int(c[2:]) if c[2:].isdigit() else 0)
+        plate_meta["fluorescence_calibration"] = {
+            "channel_calibrations": plate_meta["channel_calibrations"]}
+        if prev_meta.get("channels") and set(prev_meta["channels"]) - set(channels):
+            log(f"  merged metadata with the previous run; channels on disk: "
+                f"{plate_meta['channels']}")
     with open(ppath, "w") as fh:
         json.dump(plate_meta, fh, indent=2)
     manifest["plate_dir"] = plate_dir
@@ -786,6 +825,9 @@ if __name__ == "__main__":
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--stats-sample", type=int, default=400)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--merge-runs", action="store_true",
+                   help="join several image folders under the raw dir into "
+                        "one continuous timepoint series (interrupted run)")
     p.add_argument("--reuse-centers", action="store_true",
                    help="take crop centres from a previous run's "
                         "plate_metadata.json instead of re-detecting")
@@ -803,4 +845,5 @@ if __name__ == "__main__":
                  um_per_px_override=a.um_per_px,
                  stats_sample=a.stats_sample, overwrite=a.overwrite,
                  metadata_only=a.metadata_only,
-                 reuse_centers=a.reuse_centers))
+                 reuse_centers=a.reuse_centers,
+                 merge_runs=a.merge_runs))

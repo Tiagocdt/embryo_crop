@@ -73,6 +73,15 @@ def parse_name(name: str):
     return rec
 
 
+def find_image_dirs(root: str):
+    """Every subfolder of `root` that holds ACQUIFER frames (or root itself)."""
+    if _has_tifs(root):
+        return [root]
+    subs = [os.path.join(root, d) for d in sorted(os.listdir(root))
+            if os.path.isdir(os.path.join(root, d)) and not d.startswith("~")]
+    return [d for d in subs if _has_tifs(d)]
+
+
 def find_image_dir(root: str) -> str:
     """The newer ACQUIFER layout nests the frames one level down:
 
@@ -91,7 +100,13 @@ def find_image_dir(root: str) -> str:
     if len(hits) == 1:
         return hits[0]
     if len(hits) > 1:
-        raise ValueError(f"{root} has several image folders: {hits}. Point me at one.")
+        raise ValueError(
+            f"{root} holds {len(hits)} image folders:\n"
+            + "".join(f"    {h}\n" for h in hits)
+            + "  If this is ONE acquisition that was interrupted and restarted, "
+              "pass --merge-runs\n"
+              "  to join them into a continuous series. If they are separate "
+              "experiments, point me at one.")
     raise ValueError(f"no ACQUIFER .tif frames found in {root}")
 
 
@@ -155,7 +170,8 @@ class RawIndex:
         # is never mistaken for the interval between timepoints.
         self.interval_min = None
         series = defaultdict(dict)
-        for (pos, tp, ch, sl), (rec, _w, _f) in frames.items():
+        for (pos, tp, ch, sl), rec_t in frames.items():
+            rec = rec_t[0]
             if rec.get("T") is not None:
                 series[(pos, ch, sl)][tp] = int(rec["T"])
         gaps = []
@@ -164,6 +180,26 @@ class RawIndex:
             gaps += [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
         if gaps:
             self.interval_min = round(float(np.median(gaps)) / 60000.0, 4)
+
+        # --- the REAL time axis ------------------------------------------
+        # Median clock of each timepoint's frames. Kept because a merged or
+        # interrupted acquisition does NOT have a constant step, so anything
+        # reasoning about elapsed time must read actual times rather than
+        # multiply the index by an interval.
+        by_tp = defaultdict(list)
+        for (_p, tp, _c, _s), rec_t in frames.items():
+            if rec_t[0].get("T") is not None:
+                by_tp[tp].append(int(rec_t[0]["T"]))
+        self.tp_time_ms = {tp: int(np.median(v)) for tp, v in by_tp.items()}
+        if self.tp_time_ms:
+            t0 = min(self.tp_time_ms.values())
+            self.tp_minutes = {tp: round((t - t0) / 60000.0, 4)
+                               for tp, t in self.tp_time_ms.items()}
+        else:
+            self.tp_minutes = {}
+
+        self.segments = None
+        self.source_dirs = [image_dir]
 
         self.detect_slice = (self.slices[len(self.slices) // 2]
                              if self.slices else None)
@@ -182,6 +218,13 @@ class RawIndex:
         if not u:
             return None
         return int(round(fov_mm * 1000.0 / u))
+
+    def path(self, key):
+        """Absolute path of one frame. Frames may come from several folders
+        once runs are merged, so never join image_dir by hand."""
+        rec = self.frames[key]
+        folder = rec[3] if len(rec) > 3 else self.image_dir
+        return os.path.join(folder, rec[2])
 
     def files_for(self, pos, channel, slice_=None):
         out = []
@@ -221,6 +264,61 @@ class RawIndex:
         return "\n".join(x for x in L if x)
 
 
+def index_folders(raw_dirs, read_shape: bool = True, progress=None):
+    """Index several raw folders as ONE continuous acquisition.
+
+    An interrupted acquisition restarts its LO counter at 1, so the folders
+    cannot simply be concatenated -- the timepoints would collide. Runs are
+    sorted by their own clock, then later runs are renumbered to continue the
+    earlier ones.
+
+    The gap between runs is NOT the normal interval, and pretending otherwise
+    would quietly corrupt anything that reasons about elapsed time. So the
+    absolute millisecond clock of every timepoint is kept in `tp_time_ms`, and
+    `tp_minutes` gives minutes from the first frame. Downstream can then take
+    real deltas instead of assuming a constant step.
+    """
+    idxs = [index_folder(d, read_shape=read_shape, progress=progress)
+            for d in raw_dirs]
+    if len(idxs) == 1:
+        return idxs[0]
+
+    def t0(i):
+        ts = [int(r[0]["T"]) for r in i.frames.values() if r[0].get("T")]
+        return min(ts) if ts else 0
+    idxs.sort(key=t0)
+
+    first = idxs[0]
+    for other in idxs[1:]:
+        for attr, label in (("positions", "wells"), ("channels", "channels"),
+                            ("slices", "z-slices")):
+            if getattr(first, attr) != getattr(other, attr):
+                raise ValueError(
+                    f"cannot merge runs: {label} differ.\n"
+                    f"  {first.image_dir}: {getattr(first, attr)}\n"
+                    f"  {other.image_dir}: {getattr(other, attr)}")
+        if first.frame_shape != other.frame_shape or first.um_per_px != other.um_per_px:
+            raise ValueError(
+                f"cannot merge runs: geometry differs "
+                f"({first.frame_shape} @ {first.um_per_px} um/px vs "
+                f"{other.frame_shape} @ {other.um_per_px}).")
+
+    merged, offset, segments = {}, 0, []
+    for i in idxs:
+        hi = max(i.timepoints)
+        for (pos, tp, ch, sl), rec in i.frames.items():
+            merged[(pos, tp + offset, ch, sl)] = rec
+        segments.append({"dir": i.image_dir, "n_frames": len(i.frames),
+                         "orig_tp": [min(i.timepoints), hi],
+                         "new_tp": [1 + offset, hi + offset]})
+        offset += hi
+
+    out = RawIndex(first.image_dir, merged, first.frame_shape, first.frame_dtype)
+    out.segments = segments
+    out.source_dirs = [i.image_dir for i in idxs]
+    return out
+
+
 def index_folder(raw_dir: str, read_shape: bool = True,
                  progress=None) -> RawIndex:
     """Scan a raw folder. Filenames only -- no per-file stat(), which is what
@@ -236,7 +334,7 @@ def index_folder(raw_dir: str, read_shape: bool = True,
             if not rec:
                 continue
             frames[(rec["pos"], rec["tp"], rec["channel"], rec["slice"])] = (
-                rec, rec["well"], e.name)
+                rec, rec["well"], e.name, image_dir)
             first = first or e.name
             n += 1
             if progress and n % 5000 == 0:

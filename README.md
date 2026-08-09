@@ -292,10 +292,32 @@ line for your site, then:
 sbatch cluster_job.sh RAW_DIR OUT_DIR PLATE --scaling plate --bf-scaling image
 ```
 
+Index a folder on the server first to see what it holds — it costs seconds and
+needs no GUI:
+
+```bash
+./.venv/bin/python acquifer.py /path/on/the/server
+```
+
+### An interrupted acquisition
+
+If the microscope was stopped and restarted, the raw folder holds two image
+folders and both restart their `LO` counter at 1. `--merge-runs` joins them
+into one continuous series, ordered by their own clock:
+
+```bash
+sbatch cluster_job.sh RAW_DIR OUT_DIR PLATE --merge-runs ...
+```
+
+The step across the seam is **not** the normal interval, so the absolute time
+of every timepoint is written to `plate_metadata.json` as `tp_minutes` (minutes
+from the first frame) alongside `segments`, which records where each run began
+and ended. Anything reasoning about elapsed time should read those rather than
+multiply the timepoint index by the interval.
+
 Every `process.py` flag is passed straight through, and `--workers` comes from
 `--cpus-per-task`. Output directories are created as needed, including the
-whole nested tree — you do not have to pre-make anything. The GUI's **Cluster
-command…** button writes this line for you from the settings on screen.
+whole nested tree — you do not have to pre-make anything.
 
 It submits **one job**, not an array. The work is I/O-bound and detection runs
 a handful of times per well, so nothing here needs many machines — it needs many
