@@ -371,12 +371,27 @@ def compute_calibration(idx, st, channel, mode, log=print, centers=None,
     if n_bad:
         log(f"  {channel}: {n_bad}/{len(keys)} sampled frames unreadable "
             f"(zero-byte); excluded from the statistics")
+    # Pixels already at the sensor maximum carry no information -- they were
+    # clipped at capture, and their true value is unknown. Leaving them in the
+    # histogram lets a handful of over-exposed wells drag the high percentile
+    # to 65535, which then renders every OTHER well nearly black. Measured on
+    # AQV10, where 3 of 25 wells saturate: p99.9 over crops was 65535 with them
+    # included and 46218 without.
+    n_sat = int(hist[HIST_BINS - 1])
+    if n_sat:
+        frac = n_sat / max(1, hist.sum()) * 100
+        log(f"  {channel}: {frac:.3f}% of sampled pixels are at the sensor "
+            f"maximum ({HIST_BINS - 1}); excluded from the statistics because "
+            f"they were clipped at capture, not measured")
+        hist = hist.copy()
+        hist[HIST_BINS - 1] = 0
     lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
     scope = "crop regions" if (half and centers) else "whole frames"
     log(f"  {channel}: plate calibration from {len(keys)} {scope} in "
         f"{time.perf_counter()-t0:.1f}s -> "
         f"p{st.low_pct}={lo:.0f}  p{st.high_pct}={hi:.0f}")
     return {"mode": "plate", "lo": lo, "hi": hi, "scope": scope,
+            "saturated_px_excluded": n_sat,
             "low_pct": st.low_pct, "high_pct": st.high_pct,
             "n_frames_sampled": len(keys),
             "sampled_all": st.stats_sample <= 0 or len(keys) == len(idx.frames)}
@@ -559,7 +574,21 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                 for k in sorted(keys)[:60]:
                     accumulate(hist, tifffile.imread(
                         idx.path(k)))
-                lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
+                # Pixels already at the sensor maximum carry no information -- they were
+    # clipped at capture, and their true value is unknown. Leaving them in the
+    # histogram lets a handful of over-exposed wells drag the high percentile
+    # to 65535, which then renders every OTHER well nearly black. Measured on
+    # AQV10, where 3 of 25 wells saturate: p99.9 over crops was 65535 with them
+    # included and 46218 without.
+    n_sat = int(hist[HIST_BINS - 1])
+    if n_sat:
+        frac = n_sat / max(1, hist.sum()) * 100
+        log(f"  {channel}: {frac:.3f}% of sampled pixels are at the sensor "
+            f"maximum ({HIST_BINS - 1}); excluded from the statistics because "
+            f"they were clipped at capture, not measured")
+        hist = hist.copy()
+        hist[HIST_BINS - 1] = 0
+    lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
                 well_calib[(ch, pos)] = (lo, hi)
 
     # --- 4,5,6,7. the write pass ----------------------------------------
@@ -580,7 +609,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
 
     def one(k):
         pos, tp, ch, sl = k
-        rec, well, fname = idx.frames[k]
+        well = idx.frames[k][1]
         d = os.path.join(st.out_dir, st.dir_template.format(
             plate=plate, channel=ch, pos=pos, well=well or pos, slice=sl, tp=tp))
         fn = st.file_template.format(

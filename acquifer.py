@@ -228,9 +228,9 @@ class RawIndex:
 
     def files_for(self, pos, channel, slice_=None):
         out = []
-        for (p, tp, ch, sl), (rec, _well, fname) in self.frames.items():
+        for (p, tp, ch, sl), rec_t in self.frames.items():
             if p == pos and ch == channel and (slice_ is None or sl == slice_):
-                out.append((tp, sl, os.path.join(self.image_dir, fname)))
+                out.append((tp, sl, self.path((p, tp, ch, sl))))
         return sorted(out)
 
     def summary(self, fov_mm=DEFAULT_FOV_MM, output_px=DEFAULT_OUTPUT_PX,
