@@ -322,6 +322,9 @@ class Settings:
         # Join several image folders under one raw dir into a continuous
         # series -- an acquisition that was stopped and restarted.
         self.merge_runs = bool(kw.get("merge_runs", False))
+        # Second opinion for wells the geometric detector is unsure about.
+        self.embryonet = bool(kw.get("embryonet", True))
+        self.embryonet_model = kw.get("embryonet_model") or None
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -595,19 +598,49 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                if c["prominence"] < 2.0 or c["on_kernel_edge"]
                or c["timepoint_spread_px"] > 120}
     if suspect:
-        log(f"  WARNING: {len(suspect)} well(s) have a DOUBTFUL detection — "
-            f"check these crops before trusting them:")
+        log(f"  {len(suspect)} well(s) have a DOUBTFUL geometric detection:")
         for p, c in sorted(suspect.items()):
             why = []
             if c["prominence"] < 2.0:
-                why.append(f"weak peak (prominence {c['prominence']}, "
-                           f"typical is >3 — the well may be empty)")
+                why.append(f"weak peak (prominence {c['prominence']}, typical "
+                           f"is >3) — the geometric detector could not commit; "
+                           f"this says nothing about whether a specimen is there")
             if c["on_kernel_edge"]:
                 why.append("centre sits on the kernel boundary (edge artifact)")
             if c["timepoint_spread_px"] > 120:
                 why.append(f"disagrees by {c['timepoint_spread_px']:.0f}px "
                            f"between timepoints")
             log(f"    {p}: " + "; ".join(why))
+
+    # A doubtful score means the heuristic could not commit -- NOT that the
+    # well is empty. Ask EmbryoNet about exactly those wells. It is loaded only
+    # if there are any, and a missing model or missing TensorFlow just leaves
+    # the geometric centres in place.
+    rescued = {}
+    if suspect and not reused and st.embryonet:
+        from embryonet import try_load
+        net = try_load(st.embryonet_model, st.min_score, log)
+        if net is not None:
+            for p in sorted(suspect):
+                k = (p, probe_tps[0], dch, dsl)
+                if k not in idx.frames:
+                    continue
+                try:
+                    img = read_frame(idx.path(k))
+                except (OSError,) + UNREADABLE:
+                    continue
+                yx = net.detect(img)
+                if yx is None:
+                    log(f"    {p}: EmbryoNet also found nothing")
+                    continue
+                before = centers.get(p)
+                centers[p] = yx
+                rescued[p] = {"was": list(before) if before else None,
+                              "now": list(yx)}
+                moved = (np.hypot(yx[0] - before[0], yx[1] - before[1])
+                         if before else 0)
+                log(f"    {p}: EmbryoNet centre {yx} "
+                    f"(moved {moved:.0f}px from the geometric guess)")
 
     # --- 6a. calibration per channel ------------------------------------
     log("computing intensity calibration ...")
@@ -755,6 +788,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "centers": {p: list(c) for p, c in centers.items() if c},
         "detection_confidence": confidence,
         "wells_doubtful_detection": sorted(suspect),
+        "embryonet_rescued": rescued,
         "intensity_calibration": calib,
         "scaling_modes": modes,
         "settings": st.to_dict(),
@@ -895,6 +929,10 @@ if __name__ == "__main__":
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--stats-sample", type=int, default=400)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--no-embryonet", action="store_true",
+                   help="do not fall back to EmbryoNet for doubtful wells")
+    p.add_argument("--embryonet-model", default=None,
+                   help="path to the EmbryoNet SavedModel dir")
     p.add_argument("--merge-runs", action="store_true",
                    help="join several image folders under the raw dir into "
                         "one continuous timepoint series (interrupted run)")
@@ -916,4 +954,6 @@ if __name__ == "__main__":
                  stats_sample=a.stats_sample, overwrite=a.overwrite,
                  metadata_only=a.metadata_only,
                  reuse_centers=a.reuse_centers,
-                 merge_runs=a.merge_runs))
+                 merge_runs=a.merge_runs,
+                 embryonet=not a.no_embryonet,
+                 embryonet_model=a.embryonet_model))
