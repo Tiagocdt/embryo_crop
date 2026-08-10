@@ -89,9 +89,21 @@ def _retry(fn, *a, **kw):
 # 3. detection -- no ML, no model file, no GPU
 # ---------------------------------------------------------------------------
 def _box(a, r):
-    """Mean filter of radius r via an integral image. Zero-padded on purpose:
-    a window hanging off the edge sums less, which stops the well wall and the
-    vignette (both high-gradient) from winning the argmax."""
+    """Local mean of radius r via an integral image, ZERO-padded.
+
+    Padding decides where a specimen near the frame edge is found, and all three
+    options were measured against 96 reference centres (AQV08) plus the six
+    AQV10 wells that were cropping wrong:
+
+      zero-pad     0 of 96 reference wells off   <- shipped
+      valid-count 20 of 96 off; a well pinned to the corner (0,0)
+      reflect     12 of 96 off; same corner problem
+
+    Zero padding wins globally, so it stays. Its known cost is that a window
+    near the border is diluted by the zeros, which can drag the peak of an
+    edge-adjacent specimen inward to exactly r -- see detect_center(), which
+    detects that case rather than reporting the artifact as a centre.
+    """
     if r < 1:
         return a
     n, m = a.shape
@@ -106,24 +118,15 @@ def _box(a, r):
 # How big the specimen is, in millimetres. This is a PHYSICAL size, so the
 # smoothing radius is derived from it and um/px -- see detect_center().
 #
-# MEASURED, not guessed: the chorion of a medaka egg came out at 1.69 mm on
-# 1024px binned EMBL frames and 1.61 mm on 2048px unbinned Wittbrodt frames
-# (radial gradient profile taken about the reference centres in both).
-#
-# It does not need to be exact. Sweeping it against 40 reference centres, every
-# value from 1.5 to 1.8 mm placed all wells within half an egg-radius; the
-# default sits in the middle of that plateau rather than at its edge:
-#
-#     egg_mm   1.00  1.25  1.50  1.65  1.80  2.00  2.50
-#     median    130    69    30    26    28    46    68   px error
-#     >57px      40    26     0     0     0    10    23   wells
-#
-# For a different species, set --egg-mm instead of editing this.
+# MEASURED: the chorion came out at 1.69 mm on 1024px binned frames and 1.61 mm
+# on 2048px unbinned frames. A sweep against 40 reference centres showed a
+# working plateau from 1.5 to 1.8 mm; this sits in the middle of it.
+# For a different species, set --egg-mm rather than editing this.
 EGG_MM = 1.65
 
 
 def detect_center(img, um_per_px=None, downsample=4, egg_mm=EGG_MM,
-                  egg_frac=None):
+                  egg_frac=None, with_confidence=False):
     """(cy, cx) of the embryo, in full-resolution pixels.
 
     The egg is the only textured object in an otherwise flat well, so its
@@ -150,7 +153,24 @@ def detect_center(img, um_per_px=None, downsample=4, egg_mm=EGG_MM,
     gy, gx = np.gradient(small)
     smoothed = _box(np.hypot(gy, gx), r)
     cy, cx = np.unravel_index(np.argmax(smoothed), smoothed.shape)
-    return int(cy * downsample), int(cx * downsample)
+    if not with_confidence:
+        return int(cy * downsample), int(cx * downsample)
+
+    # How much do we believe this? Two independent warning signs:
+    #
+    #  prominence  peak / median of the smoothed energy. An EMPTY well has no
+    #              specimen to concentrate gradient, so the peak is barely above
+    #              the background. Measured on AQV10: empty wells 1.39 and 1.43,
+    #              every well holding an embryo 2.99 or more.
+    #  on_edge     the argmax sitting exactly at r or n-1-r is the zero-padding
+    #              artifact, not a specimen -- the dilution near the border
+    #              makes that the fallback position when nothing else wins.
+    med = float(np.median(smoothed))
+    prominence = float(smoothed.max() / med) if med > 0 else float("inf")
+    n, m = smoothed.shape
+    on_edge = bool(cy in (r, n - 1 - r) or cx in (r, m - 1 - r))
+    return (int(cy * downsample), int(cx * downsample),
+            {"prominence": round(prominence, 2), "on_kernel_edge": on_edge})
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +511,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
     # --- 3. detect once per well, on the detect slice/channel -----------
     # --- reuse centres from a previous run, if asked ---------------------
     centers = {}
+    confidence = {}
     reused = False
     if st.reuse_centers:
         prev = os.path.join(st.out_dir, plate, "plate_metadata.json")
@@ -528,7 +549,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         """Median centre from a few probe frames. Unreadable frames are skipped
         and further timepoints tried, so a handful of zero-byte files cannot
         cost the whole well -- let alone the whole plate."""
-        pts, tried, bad = [], 0, 0
+        pts, confs, tried, bad = [], [], 0, 0
         for tp in probe_tps + extra_tps:
             if len(pts) >= len(probe_tps) or tried >= MAX_DETECT_TRIES:
                 break
@@ -541,21 +562,52 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             except (OSError,) + UNREADABLE:
                 bad += 1
                 continue
-            pts.append(detect_center(img, um_per_px=um, egg_mm=st.egg_mm))
+            cy, cx, conf = detect_center(img, um_per_px=um, egg_mm=st.egg_mm,
+                                         with_confidence=True)
+            pts.append((cy, cx))
+            confs.append(conf)
         if not pts:
-            return pos, None
-        return pos, (int(np.median([p[0] for p in pts])),
-                     int(np.median([p[1] for p in pts])))
+            return pos, None, None
+        med = (int(np.median([p[0] for p in pts])),
+               int(np.median([p[1] for p in pts])))
+        spread = max((float(np.hypot(a[0] - b[0], a[1] - b[1]))
+                      for a in pts for b in pts), default=0.0)
+        c = {"prominence": min(x["prominence"] for x in confs),
+             "on_kernel_edge": any(x["on_kernel_edge"] for x in confs),
+             "timepoint_spread_px": round(spread, 1)}
+        return pos, med, c
 
     if not reused:
         with ThreadPoolExecutor(max_workers=st.workers) as ex:
-            for i, (pos, c) in enumerate(ex.map(det, positions)):
+            for i, (pos, c, conf) in enumerate(ex.map(det, positions)):
                 centers[pos] = c
+                if conf:
+                    confidence[pos] = conf
                 if progress:
                     progress(i + 1, len(positions), f"detect {pos}")
     bad = [p for p, c in centers.items() if c is None]
     if bad:
         log(f"  WARNING: no detection for {bad}")
+    # A specimen concentrates gradient; an empty well does not, and the argmax
+    # then falls on the zero-padding artifact at exactly the kernel radius.
+    # Say so rather than emitting a confident-looking centre for nothing.
+    suspect = {p: c for p, c in confidence.items()
+               if c["prominence"] < 2.0 or c["on_kernel_edge"]
+               or c["timepoint_spread_px"] > 120}
+    if suspect:
+        log(f"  WARNING: {len(suspect)} well(s) have a DOUBTFUL detection — "
+            f"check these crops before trusting them:")
+        for p, c in sorted(suspect.items()):
+            why = []
+            if c["prominence"] < 2.0:
+                why.append(f"weak peak (prominence {c['prominence']}, "
+                           f"typical is >3 — the well may be empty)")
+            if c["on_kernel_edge"]:
+                why.append("centre sits on the kernel boundary (edge artifact)")
+            if c["timepoint_spread_px"] > 120:
+                why.append(f"disagrees by {c['timepoint_spread_px']:.0f}px "
+                           f"between timepoints")
+            log(f"    {p}: " + "; ".join(why))
 
     # --- 6a. calibration per channel ------------------------------------
     log("computing intensity calibration ...")
@@ -701,6 +753,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "tp_minutes": idx.tp_minutes,
         "tp_time_ms": idx.tp_time_ms,
         "centers": {p: list(c) for p, c in centers.items() if c},
+        "detection_confidence": confidence,
+        "wells_doubtful_detection": sorted(suspect),
         "intensity_calibration": calib,
         "scaling_modes": modes,
         "settings": st.to_dict(),
@@ -755,7 +809,8 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                           "well_id": idx.pos_to_well.get(p) or p,
                           "status": "ok" if centers.get(p) else "no_detection",
                           "center_yx": list(centers[p]) if centers.get(p) else None,
-                          "crop_fill_frac": round(fill.get(p, 1.0), 4)}
+                          "crop_fill_frac": round(fill.get(p, 1.0), 4),
+                          "detection": confidence.get(p)}
                       for p in positions},
     }
     if idx.interval_min:
