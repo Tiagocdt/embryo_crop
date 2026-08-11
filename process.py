@@ -873,6 +873,19 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             key=lambda c: int(c[2:]) if c[2:].isdigit() else 0)
         plate_meta["fluorescence_calibration"] = {
             "channel_calibrations": plate_meta["channel_calibrations"]}
+        # Carry provenance forward. A re-crop with --reuse-centers rewrites this
+        # file, and without this it silently drops the record of WHERE a centre
+        # came from -- the centres themselves survive, but "this well was
+        # re-detected by EmbryoNet" does not, which is exactly the thing you
+        # want to be able to look up later.
+        prev_res = prev_meta.get("embryonet_rescued") or {}
+        if prev_res:
+            plate_meta["embryonet_rescued"] = {
+                **prev_res, **(plate_meta.get("embryonet_rescued") or {})}
+        for p, pv in (prev_meta.get("positions") or {}).items():
+            src = pv.get("center_source")
+            if src and p in plate_meta.get("positions", {}):
+                plate_meta["positions"][p].setdefault("center_source", src)
         if prev_meta.get("channels") and set(prev_meta["channels"]) - set(channels):
             log(f"  merged metadata with the previous run; channels on disk: "
                 f"{plate_meta['channels']}")
