@@ -325,6 +325,9 @@ class Settings:
         # Second opinion for wells the geometric detector is unsure about.
         self.embryonet = bool(kw.get("embryonet", True))
         self.embryonet_model = kw.get("embryonet_model") or None
+        # EmbryoNet detection-score floor; below this a box is not a specimen.
+        # 0.1 is what the previous pipeline used.
+        self.min_score = float(kw.get("min_score", 0.1))
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items()}
