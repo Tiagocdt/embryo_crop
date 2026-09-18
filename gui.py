@@ -114,17 +114,37 @@ class App:
         self.lowp = tk.StringVar(value="1.0")
         self.highp = tk.StringVar(value="99.9")
         ttk.Label(r, text="low %").pack(side="left", padx=(12, 0))
-        ttk.Entry(r, textvariable=self.lowp, width=6).pack(side="left", padx=4)
+        lowe = ttk.Entry(r, textvariable=self.lowp, width=6)
+        lowe.pack(side="left", padx=4)
         ttk.Label(r, text="high %").pack(side="left")
-        ttk.Entry(r, textvariable=self.highp, width=6).pack(side="left", padx=4)
+        highe = ttk.Entry(r, textvariable=self.highp, width=6)
+        highe.pack(side="left", padx=4)
         self.flo = tk.StringVar(value="")
         self.fhi = tk.StringVar(value="")
         ttk.Label(r, text="fixed lo/hi").pack(side="left", padx=(12, 0))
-        ttk.Entry(r, textvariable=self.flo, width=7).pack(side="left", padx=2)
-        ttk.Entry(r, textvariable=self.fhi, width=7).pack(side="left", padx=2)
+        floe = ttk.Entry(r, textvariable=self.flo, width=7)
+        floe.pack(side="left", padx=2)
+        fhie = ttk.Entry(r, textvariable=self.fhi, width=7)
+        fhie.pack(side="left", padx=2)
         self.sample = tk.StringVar(value="400")
         ttk.Label(r, text="stats frames (0=all)").pack(side="left", padx=(12, 0))
-        ttk.Entry(r, textvariable=self.sample, width=7).pack(side="left", padx=4)
+        sampe = ttk.Entry(r, textvariable=self.sample, width=7)
+        sampe.pack(side="left", padx=4)
+        # the controls that only mean something when counts ARE rescaled
+        self._scale_widgets = [cb, lowe, highe, floe, fhie, sampe]
+        self._chmode_boxes = []
+        # One switch for "do not touch the counts": every channel is written
+        # as the camera's native 16-bit values, so the crops stay quantitative
+        # (identical to --scaling raw16 / --keep-16bit on the command line).
+        # It is a separate, permanent control because per-channel modes are
+        # rebuilt on every Probe and are easy to leave at a rescaling default.
+        r2 = ttk.Frame(f5); r2.pack(fill="x", **pad)
+        self.native16 = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            r2, text="keep native bit depth: write every channel as raw 16-bit "
+                     "counts, no intensity rescaling (= --scaling raw16)",
+            variable=self.native16,
+            command=self._apply_native16).pack(side="left")
         self.schelp = ttk.Label(f5, text="", foreground="#555")
         self.schelp.pack(anchor="w", padx=10)
         self._scaling_help()
@@ -227,6 +247,7 @@ class App:
 
     def _checkboxes(self):
         self.chmodes = {}
+        self._chmode_boxes = []
         for box, store, items, label in (
                 (self.chbox, self.chvars, self.idx.channels, "channels"),
                 (self.slbox, self.slvars, self.idx.slices, "z-slices")):
@@ -257,9 +278,13 @@ class App:
                                       state="readonly",
                                       values=list(process.SCALING_MODES))
                     cb.pack(side="left", padx=(0, 10))
+                    self._chmode_boxes.append(cb)
                     if it == self.idx.detect_channel:
                         ttk.Label(box, text="(BF)",
                                   foreground="#777").pack(side="left", padx=(0, 8))
+        # a Probe rebuilds the per-channel boxes with rescaling defaults;
+        # the native-16-bit switch must win over them every time
+        self._apply_native16()
 
     def _selected(self, store, all_items):
         picked = [k for k, v in store.items() if k != "__all__" and v.get()]
@@ -301,6 +326,31 @@ class App:
         }.get(m, "")
         self.schelp.config(text=t)
 
+    def _apply_native16(self):
+        """Tick: every channel raw16 and the rescaling controls greyed out.
+        Untick: controls back, and any channel left on raw16 returns to its
+        default (image for brightfield, plate otherwise)."""
+        on = bool(self.native16.get())
+        if on:
+            self.scaling.set("raw16")
+        elif self.scaling.get() == "raw16":
+            self.scaling.set("plate")
+        for ch, m in getattr(self, "chmodes", {}).items():
+            if on:
+                m.set("raw16")
+            elif m.get() == "raw16":
+                bf = self.idx is not None and ch == self.idx.detect_channel
+                m.set("image" if bf else "plate")
+        for w in getattr(self, "_scale_widgets", []):
+            if on:
+                w.config(state="disabled")
+            else:
+                w.config(state="readonly" if isinstance(w, ttk.Combobox)
+                         else "normal")
+        for b in getattr(self, "_chmode_boxes", []):
+            b.config(state="disabled" if on else "readonly")
+        self._scaling_help()
+
     def _apply_level(self):
         lvl = self.level.get()
         if lvl == "manual":
@@ -325,7 +375,8 @@ class App:
             fov_mm=self._f(self.fov, acquifer.DEFAULT_FOV_MM),
             output_px=int(self._f(self.outpx, acquifer.DEFAULT_OUTPUT_PX)),
             um_per_px_override=(self._f(self.umpx, 0) or None),
-            scaling=self._scaling_spec(),
+            scaling=("raw16" if self.native16.get() else self._scaling_spec()),
+            native_bits=bool(self.native16.get()),
             low_pct=self._f(self.lowp, 1.0), high_pct=self._f(self.highp, 99.9),
             fixed_lo=(self._f(self.flo, 0) or None),
             fixed_hi=(self._f(self.fhi, 0) or None),
@@ -371,6 +422,8 @@ class App:
         self.outpx.set(str(s.get("output_px", acquifer.DEFAULT_OUTPUT_PX)))
         self.umpx.set(str(s.get("um_per_px_override") or ""))
         self.scaling.set(s.get("scaling", "plate"))
+        self.native16.set(bool(s.get("native_bits"))
+                          or s.get("scaling", "") == "raw16")
         self.lowp.set(str(s.get("low_pct", 1.0)))
         self.highp.set(str(s.get("high_pct", 99.9)))
         self.sample.set(str(s.get("stats_sample", 400)))
@@ -382,7 +435,7 @@ class App:
         self.level.set("manual")
         if self.raw.get():
             self._probe()
-        self._scaling_help()
+        self._apply_native16()
 
     # -- queue -----------------------------------------------------------
     def _add(self):
