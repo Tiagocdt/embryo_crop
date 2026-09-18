@@ -20,8 +20,11 @@ INTENSITY SCALING -- the only real choice in here
     fixed   one constant LO:HI you supply. Comparable across plates.
     plate   percentiles over the WHOLE plate, one map per channel.  <- default
             Comparable across wells and timepoints within the plate.
-    well    percentiles over one well's whole movie ("per trajectory").
-            Comparable across timepoints, NOT across wells.
+    well    percentiles over one well's whole movie ("per trajectory"),
+            sampled with an EVEN STRIDE over every timepoint and z-slice of
+            that well, taken over the CROP REGION, with sensor-saturated
+            pixels excluded. Comparable across timepoints, NOT across wells.
+            Use this when one bright well would otherwise clip the rest.
     image   percentiles of that single frame. Auto-contrast. Comparable with
             NOTHING. Every frame is stretched to look good individually.
 
@@ -34,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -43,6 +47,27 @@ from acquifer import (DEFAULT_FOV_MM, DEFAULT_OUTPUT_PX, find_image_dirs,
                       index_folder, index_folders)
 
 SCALING_MODES = ("plate", "well", "image", "fixed", "raw16")
+
+# Stamped into every manifest so a processed tree can always be traced back to
+# the exact code that made it. Without this you cannot tell whether a plate was
+# cropped before or after a behaviour change -- e.g. the 2026-08-19 fix to
+# per-well scaling, which changed what the pixels mean.
+CODE_VERSION = "2026-08-19.well-scaling-fix"
+
+
+def _git_rev():
+    """Short commit of this checkout, or None outside a git tree."""
+    import subprocess as _sp
+    try:
+        return _sp.run(["git", "-C", os.path.dirname(os.path.abspath(__file__)),
+                        "rev-parse", "--short", "HEAD"],
+                       capture_output=True, text=True, timeout=5
+                       ).stdout.strip() or None
+    except Exception:
+        return None
+
+
+
 HIST_BINS = 65536
 
 # An external drive that drops off the bus throws OSError mid-run. Retry a few
@@ -348,8 +373,18 @@ def _sample_frames(idx, channel, n):
     return [keys[int(i * step)] for i in range(n)]
 
 
+def _median3(v):
+    """Median filter of width 3, endpoints kept. Suppresses a lone detection
+    that landed on debris without lagging a real, sustained move."""
+    if len(v) < 3:
+        return [int(x) for x in v]
+    return ([int(v[0])]
+            + [int(np.median(v[i - 1:i + 2])) for i in range(1, len(v) - 1)]
+            + [int(v[-1])])
+
+
 def compute_calibration(idx, st, channel, mode, log=print, centers=None,
-                        crop_px=None):
+                        crop_px=None, centers_tp=None):
     """One LO/HI for `channel`, over the scope `mode` asks for."""
     if mode == "raw16":
         return {"mode": "raw16", "lo": None, "hi": None}
@@ -379,11 +414,12 @@ def compute_calibration(idx, st, channel, mode, log=print, centers=None,
 
     def rd(k):
         try:
-            a = read_frame(idx.path(k))
+            a = idx.read(k)
         except (OSError,) + UNREADABLE:
             return None                      # zero-byte frame: not in the stats
-        if half and centers and centers.get(k[0]):
-            cy, cx = centers[k[0]]
+        c = (centers_tp or {}).get((k[0], k[1])) or (centers or {}).get(k[0])
+        if half and c:
+            cy, cx = c
             a = a[max(0, cy - half):cy + half, max(0, cx - half):cx + half]
         return a
 
@@ -469,7 +505,19 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
     """Process one plate. `progress(done, total, message)` drives the GUI."""
     t_start = time.perf_counter()
     log(f"indexing {st.raw_dir} ...")
-    if st.merge_runs:
+    # Which microscope wrote this? Decided by what is on disk, not by a flag,
+    # so the same command works for an ACQUIFER folder of per-frame TIFFs and a
+    # Nikon Ti2 folder of .nd2 containers. Everything downstream reads frames
+    # through idx.read(key) and never learns the difference.
+    from nikon_nd2 import index_nd2_folder, looks_like_nd2_dir
+    if looks_like_nd2_dir(st.raw_dir):
+        log("  source looks like Nikon Ti2 .nd2")
+        idx = index_nd2_folder(st.raw_dir,
+                              progress=lambda i, n, f: progress(i, n, f)
+                              if progress else None)
+        if st.merge_runs:
+            log("  --merge-runs ignored: point at one .nd2 session")
+    elif st.merge_runs:
         dirs = find_image_dirs(st.raw_dir)
         if len(dirs) > 1:
             log(f"merging {len(dirs)} runs into one continuous series:")
@@ -564,7 +612,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                 continue
             tried += 1
             try:
-                img = read_frame(idx.path(k))
+                img = idx.read(k)
             except (OSError,) + UNREADABLE:
                 bad += 1
                 continue
@@ -629,7 +677,7 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                 if k not in idx.frames:
                     continue
                 try:
-                    img = read_frame(idx.path(k))
+                    img = idx.read(k)
                 except (OSError,) + UNREADABLE:
                     continue
                 yx = net.detect(img)
@@ -645,25 +693,163 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                 log(f"    {p}: EmbryoNet centre {yx} "
                     f"(moved {moved:.0f}px from the geometric guess)")
 
+    # --- 3b. optionally FOLLOW the specimen through time -----------------
+    # One centre per well assumes the specimen barely moves relative to the
+    # crop's own margin. That holds when the frame is not much wider than the
+    # egg (a 1024px frame at 3.25 um/px is 3.3mm across) and fails when it is:
+    # a 2048px frame at 3.25 um/px shows 6.7mm of well for a 1.6mm egg, and the
+    # egg wanders. Measured on OLVAS V1: up to 176px of drift inside one run
+    # and a median 145px STEP across a restart seam (max 431px), against a
+    # margin of only (576-490)/2 = 43px. A fixed centre clips those embryos --
+    # and clips them silently, because crop_fill_frac only counts padding at
+    # the FRAME edge, not an egg that has walked out of a crop taken from the
+    # middle of the frame.
+    #
+    # So: sample the centre every `detect_every` timepoints and give each
+    # timepoint the nearest sample TAKEN IN ITS OWN SEGMENT. Never across a
+    # seam -- there the plate was physically handled, so the change is a step
+    # and interpolating through it would put the crop where the embryo never
+    # was. A median of three consecutive samples absorbs the occasional
+    # detection that lands on debris instead of the egg.
+    centers_tp = {}
+    track_excursion = {}
+    if st.detect_every and not reused:
+        every = max(1, int(st.detect_every))
+        seg_of = {}
+        if idx.segments:
+            for si, s in enumerate(idx.segments):
+                for t in range(s["new_tp"][0], s["new_tp"][1] + 1):
+                    seg_of[t] = si
+        seg_tps = defaultdict(list)
+        for t in tps:
+            seg_tps[seg_of.get(t, 0)].append(t)
+        sample = set()
+        for ts in seg_tps.values():
+            sample |= set(ts[::every]) | {ts[0], ts[-1]}
+        sample = sorted(sample)
+        log(f"tracking centres: 1 detection every {every} timepoint(s) "
+            f"-> {len(sample)} samples x {len(positions)} wells")
+
+        def track(pos):
+            got = {}
+            for t in sample:
+                k = (pos, t, dch, dsl)
+                if k not in idx.frames:
+                    continue
+                try:
+                    img = idx.read(k)
+                except (OSError,) + UNREADABLE:
+                    continue
+                got[t] = detect_center(img, um_per_px=um, egg_mm=st.egg_mm)
+            return pos, got
+
+        with ThreadPoolExecutor(max_workers=st.workers) as ex:
+            for i, (pos, got) in enumerate(ex.map(track, positions)):
+                if progress:
+                    progress(i + 1, len(positions), f"track {pos}")
+                if not got:
+                    continue
+                pts = []
+                for si, ts in seg_tps.items():
+                    have = [t for t in sorted(got) if seg_of.get(t, 0) == si]
+                    if not have:
+                        continue
+                    ys = _median3([got[t][0] for t in have])
+                    xs = _median3([got[t][1] for t in have])
+                    arr = np.asarray(have)
+                    for t in ts:
+                        j = int(np.argmin(np.abs(arr - t)))
+                        centers_tp[(pos, t)] = (ys[j], xs[j])
+                    pts += list(zip(ys, xs))
+                if pts:
+                    centers[pos] = (int(np.median([p[0] for p in pts])),
+                                    int(np.median([p[1] for p in pts])))
+                    track_excursion[pos] = round(max(
+                        float(np.hypot(a[0] - b[0], a[1] - b[1]))
+                        for a in pts for b in pts), 1)
+        if track_excursion:
+            worst = sorted(track_excursion.items(),
+                           key=lambda kv: -kv[1])[:5]
+            log(f"  centre travelled: median {np.median(list(track_excursion.values())):.0f}px, "
+                f"worst " + ", ".join(f"{p} {d:.0f}px" for p, d in worst))
+
+    def center_for(pos, tp):
+        """The centre to crop THIS frame around. Falls back to the well's
+        single centre whenever tracking is off or produced nothing."""
+        if centers_tp:
+            c = centers_tp.get((pos, tp))
+            if c is not None:
+                return c
+        return centers.get(pos)
+
     # --- 6a. calibration per channel ------------------------------------
     log("computing intensity calibration ...")
     calib = {ch: compute_calibration(idx, st, ch, modes[ch], log,
-                                     centers=centers, crop_px=crop_px)
+                                     centers=centers, crop_px=crop_px,
+                                     centers_tp=centers_tp)
              for ch in channels}
 
     # per-well calibration if that is the chosen scope
     well_calib = {}
+    well_calib_meta = {}
     if "well" in modes.values():
+        half_w = (crop_px // 2) if crop_px else None
         for ch in [c for c in channels if modes[c] == "well"]:
+            log(f"  {ch}: per-well calibration over each well's FULL trajectory")
+            n_sat_tot = 0
             for pos in idx.positions:
-                keys = [k for k in idx.frames
-                        if k[0] == pos and k[2] == ch and k[3] == dsl]
+                # EVERY timepoint and z-slice of this well, then an even stride
+                # over them. Taking the FIRST n (what this used to do) calibrates
+                # on the start of the trajectory, so anything that grows brighter
+                # later clips -- which is the exact failure per-well scaling is
+                # meant to prevent. z-slices are included because a stack is not
+                # uniformly bright.
+                keys = sorted(k for k in idx.frames
+                              if k[0] == pos and k[2] == ch)
+                if not keys:
+                    continue
+                n = min(len(keys), max(1, st.stats_sample or 200))
+                step = len(keys) / float(n)
+                sample = [keys[int(i * step)] for i in range(n)]
                 hist = np.zeros(HIST_BINS, dtype=np.int64)
-                for k in sorted(keys)[:60]:
-                    accumulate(hist, tifffile.imread(
-                        idx.path(k)))
-                lo, hi = percentiles_from_hist(hist, [st.low_pct, st.high_pct])
+                for k in sample:
+                    cen = center_for(pos, k[1])
+                    try:
+                        a = idx.read(k)
+                    except (OSError,) + UNREADABLE:
+                        continue          # zero-byte frame: not in the stats
+                    # Crop region, not the whole frame: a raw frame is mostly
+                    # empty well, so a whole-frame percentile is set by
+                    # background and the specimen's bright interior clips.
+                    if half_w and cen:
+                        cy, cx = cen
+                        a = a[max(0, cy - half_w):cy + half_w,
+                              max(0, cx - half_w):cx + half_w]
+                    accumulate(hist, a)
+                # Pixels at the sensor maximum were clipped at capture, so their
+                # true value is unknown; leaving them in drags the high
+                # percentile up and renders the rest of the well dark.
+                n_sat = int(hist[HIST_BINS - 1])
+                n_sat_tot += n_sat
+                if n_sat:
+                    hist = hist.copy()
+                    hist[HIST_BINS - 1] = 0
+                lo, hi = percentiles_from_hist(hist,
+                                               [st.low_pct, st.high_pct])
                 well_calib[(ch, pos)] = (lo, hi)
+                well_calib_meta[f"{ch}|{pos}"] = {
+                    "lo": float(lo), "hi": float(hi),
+                    "n_frames_sampled": len(sample),
+                    "saturated_px_excluded": n_sat,
+                    "scope": "crop region" if (half_w and cen) else "whole frame",
+                    "low_pct": st.low_pct, "high_pct": st.high_pct}
+            los = [v[0] for (c, _p), v in well_calib.items() if c == ch]
+            his = [v[1] for (c, _p), v in well_calib.items() if c == ch]
+            if los:
+                log(f"  {ch}: {len(los)} wells calibrated  "
+                    f"lo {min(los):.0f}..{max(los):.0f}  "
+                    f"hi {min(his):.0f}..{max(his):.0f}  "
+                    f"({n_sat_tot:,} saturated px excluded)")
 
     # --- 4,5,6,7. the write pass ----------------------------------------
     jobs = [k for k in idx.frames if k[2] in channels and k[3] in slices
@@ -693,11 +879,11 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             skipped[0] += 1
             return
         try:
-            img = read_frame(idx.path(k))
+            img = idx.read(k)
         except (OSError,) + UNREADABLE as e:
             failed.append((str(k), f"read: {type(e).__name__}: {e}"))
             return
-        cy, cx = centers[pos]
+        cy, cx = center_for(pos, tp)
         c, f, valid = crop_at(img, cy, cx, crop_px)
         # keep the WORST fill seen for this well; a perfect 1.0 must still be
         # recorded, so every well appears in the manifest
@@ -789,10 +975,15 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
         "tp_minutes": idx.tp_minutes,
         "tp_time_ms": idx.tp_time_ms,
         "centers": {p: list(c) for p, c in centers.items() if c},
+        "detect_every": st.detect_every,
+        "center_travel_px": track_excursion,
         "detection_confidence": confidence,
         "wells_doubtful_detection": sorted(suspect),
         "embryonet_rescued": rescued,
+        "code_version": CODE_VERSION,
+        "git_rev": _git_rev(),
         "intensity_calibration": calib,
+        "well_calibration": well_calib_meta,
         "scaling_modes": modes,
         "settings": st.to_dict(),
     }
@@ -847,11 +1038,22 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
                           "status": "ok" if centers.get(p) else "no_detection",
                           "center_yx": list(centers[p]) if centers.get(p) else None,
                           "crop_fill_frac": round(fill.get(p, 1.0), 4),
+                          "center_travel_px": track_excursion.get(p),
                           "detection": confidence.get(p)}
                       for p in positions},
     }
     if idx.interval_min:
         plate_meta["timepoint_interval_min"] = idx.interval_min
+    # The centre actually used for every frame. This is the only independent
+    # record of where the specimen was, so it is written even though it is the
+    # largest thing in the file.
+    if centers_tp:
+        plate_meta["detect_every"] = st.detect_every
+        per_tp = defaultdict(dict)
+        for (p, t), c in centers_tp.items():
+            per_tp[p][t] = [int(c[0]), int(c[1])]
+        plate_meta["centers_per_tp"] = {p: dict(sorted(v.items()))
+                                        for p, v in sorted(per_tp.items())}
     for k in ("line", "guide", "assay"):          # omitted when not set
         if getattr(st, k):
             plate_meta[k] = getattr(st, k)
@@ -871,9 +1073,14 @@ def run(st: Settings, log=print, progress=None, should_stop=None):
             merged_key = dict(prev_meta.get(key) or {})
             merged_key.update(plate_meta.get(key) or {})
             plate_meta[key] = merged_key
+        # Sort ACQUIFER channels by their number (CO2 before CO6) but fall back
+        # to plain name order for other microscopes, whose channels are named
+        # ("Dia", "475", "mscarlet") rather than numbered.
+        def _ch_key(c):
+            return (0, int(c[2:])) if c[:2] == "CO" and c[2:].isdigit() else (1, c)
         plate_meta["channels"] = sorted(
             set(prev_meta.get("channels") or []) | set(plate_meta.get("channels") or []),
-            key=lambda c: int(c[2:]) if c[2:].isdigit() else 0)
+            key=_ch_key)
         plate_meta["fluorescence_calibration"] = {
             "channel_calibrations": plate_meta["channel_calibrations"]}
         # Carry provenance forward. A re-crop with --reuse-centers rewrites this
@@ -955,14 +1162,26 @@ if __name__ == "__main__":
     p.add_argument("--reuse-centers", action="store_true",
                    help="take crop centres from a previous run's "
                         "plate_metadata.json instead of re-detecting")
+    p.add_argument("--detect-every", type=int, default=0,
+                   help="re-detect the centre every N timepoints and follow "
+                        "the specimen, instead of one fixed centre per well. "
+                        "Needed when the frame is much wider than the "
+                        "specimen, or when a restarted run moved the plate. "
+                        "0 (default) = one centre per well")
     p.add_argument("--metadata-only", action="store_true",
                    help="only (re)write plate_metadata.json; touch no images")
+    p.add_argument("--keep-16bit", action="store_true",
+                   help="write every channel as the camera's native 16-bit "
+                        "counts with no intensity rescaling. Identical to "
+                        "--scaling raw16; overrides --scaling and --bf-scaling")
     a = p.parse_args()
     run(Settings(raw_dir=a.raw_dir, out_dir=a.out_dir, plate=a.plate,
                  channels=[c for c in a.channels.split(",") if c],
                  positions=[w for w in a.wells.split(",") if w],
                  line=a.line, guide=a.guide, assay=a.assay,
-                 scaling=a.scaling, bf_scaling=a.bf_scaling, egg_mm=a.egg_mm,
+                 scaling=("raw16" if a.keep_16bit else a.scaling),
+                 bf_scaling=(None if a.keep_16bit else a.bf_scaling),
+                 egg_mm=a.egg_mm,
                  low_pct=a.low_pct, high_pct=a.high_pct,
                  fixed_lo=a.fixed_lo, fixed_hi=a.fixed_hi,
                  fov_mm=a.fov_mm, output_px=a.output_px, workers=a.workers,
@@ -970,6 +1189,7 @@ if __name__ == "__main__":
                  stats_sample=a.stats_sample, overwrite=a.overwrite,
                  metadata_only=a.metadata_only,
                  reuse_centers=a.reuse_centers,
+                 detect_every=a.detect_every,
                  merge_runs=a.merge_runs,
                  embryonet=not a.no_embryonet,
                  embryonet_model=a.embryonet_model))

@@ -84,11 +84,35 @@ On a 2048 px frame where the egg is ~480 px across and the crop is 576 px, a
 well.
 
 Detection runs a few times per well and the median centre is reused for that
-well's whole time course, so a drifting embryo stays centred without re-running
-detection on every frame. If your specimens are not round, high-contrast objects
+well's whole time course. If your specimens are not round, high-contrast objects
 on a plain background, this heuristic is the first thing to re-check — swap
 `detect_center()` in `process.py` for whatever suits your images; everything
 else is independent of how the centre was found.
+
+### When one centre per well is not enough
+
+A single centre only works while the specimen cannot travel further than the
+crop's own margin. That margin is small — a 1.6 mm egg in a 1.872 mm crop
+leaves about 43 px — and how far the specimen *can* travel depends on how much
+well the frame shows: 3.3 mm on a 1024 px frame at 3.25 µm/px, but **6.7 mm**
+on a 2048 px one. On the wider frame, measured drift reached 176 px within a
+run and 431 px across a restart, which clips the specimen while
+`crop_fill_frac` still reads a contented 1.0 — that statistic only sees a crop
+leaving the *frame*.
+
+`--detect-every N` follows it instead: one detection every N timepoints, each
+timepoint taking the nearest sample **from its own segment**, never across a
+merge seam (there the plate was physically handled, so the change is a step and
+interpolating through it would put the crop where the specimen never was). A
+median of three consecutive samples absorbs the occasional detection that lands
+on debris. The centre used for every frame is written to `centers_per_tp` and
+the distance travelled per well to `center_travel_px`, so how much each
+specimen moved is a result you can read rather than an artefact you have to
+trust.
+
+Cost is one extra read per sampled timepoint and well: at `--detect-every 5` on
+a 288-timepoint, 30-well plate that is 1,800 frames against the 52,000 the run
+writes anyway.
 
 ## Intensity scaling — choose the scope on purpose
 
@@ -106,7 +130,10 @@ Percentiles (default 1 % / 99.9 %) rather than min–max, because a single hot
 pixel sets a min–max range.
 
 **Which to pick.** For *fluorescence you intend to measure*, use `raw16`, or
-`plate` if you need 8-bit. Never `image` — it rescales every frame to look good
+`plate` if you need 8-bit. To keep the camera's native 16-bit counts for EVERY
+channel there is one permanent switch: `--keep-16bit` on the command line, or
+the "keep native bit depth" checkbox in the GUI (it sets every channel to
+`raw16` and greys out the rescaling controls, and it survives a re-Probe). Never `image` — it rescales every frame to look good
 and destroys exactly the signal you are trying to quantify.
 
 For *brightfield*, `image` is often the right answer and `plate` can be worse in
@@ -198,6 +225,7 @@ Useful flags:
 --channels CO1,CO2       default: all
 --wells A01,A02          default: all
 --scaling MODE           plate | well | image | fixed | raw16
+--keep-16bit             every channel as native 16-bit counts (= --scaling raw16)
 --low-pct / --high-pct   percentiles (default 1.0 / 99.9)
 --fixed-lo / --fixed-hi  required when --scaling fixed
 --fov-mm / --output-px   the physical crop and the output size
@@ -205,6 +233,7 @@ Useful flags:
 --stats-sample N         frames sampled for plate statistics; 0 = every frame
 --metadata-only          rewrite plate_metadata.json, touch no images
 --overwrite              redo files that already exist
+--detect-every N         re-detect every N timepoints and follow the specimen
 ```
 
 Inspect without processing anything:
@@ -312,8 +341,25 @@ sbatch cluster_job.sh RAW_DIR OUT_DIR PLATE --merge-runs ...
 The step across the seam is **not** the normal interval, so the absolute time
 of every timepoint is written to `plate_metadata.json` as `tp_minutes` (minutes
 from the first frame) alongside `segments`, which records where each run began
-and ended. Anything reasoning about elapsed time should read those rather than
-multiply the timepoint index by the interval.
+and ended, in both timepoints and real minutes. Anything reasoning about
+elapsed time should read those rather than multiply the timepoint index by the
+interval.
+
+Two things about restarts that cost real time to find:
+
+- The `T` token is a **32-bit millisecond counter**, so it returns to zero
+  every 49.7 days and the microscope does not reset it between runs. It is
+  unwrapped before use, and runs are ordered by the timestamp in the folder
+  name, which a wrap cannot corrupt. `clock_wraps` in the summary says whether
+  it happened.
+- **Wells may legitimately differ between runs** — an embryo that died or was
+  discontinued is simply absent from the restart. The merged index keeps the
+  union and records `wells` / `wells_absent` per segment. Channels, z-slices
+  and geometry must still match; those differing means two experiments, not
+  one interrupted one.
+
+Across a seam the plate was physically handled, so specimens jump. Pair
+`--merge-runs` with `--detect-every` unless you have checked that they did not.
 
 Every `process.py` flag is passed straight through, and `--workers` comes from
 `--cpus-per-task`. Output directories are created as needed, including the
