@@ -49,6 +49,57 @@ NATIVE_SENSOR_PX = 2048
 DEFAULT_FOV_MM = 1.872
 DEFAULT_OUTPUT_PX = 576
 
+# The T token is a 32-bit millisecond counter, so it returns to zero every
+# 2**32 ms = 49.7 days and the microscope does NOT reset it per acquisition.
+CLOCK_PERIOD_MS = 1 << 32
+
+
+def unwrap_clock(values):
+    """Undo the 32-bit wraparound of an increasing millisecond clock.
+
+    `values` must already be in acquisition order. Any drop of more than half
+    the period is a wrap rather than time running backwards -- unambiguous as
+    long as the timepoint interval is shorter than ~25 days.
+
+    Real example: the OLVAS V1 plate crossed the boundary mid-run. LO001 reads
+    4,171,231,685 and LO070 reads 464,389. Untreated, `tp_minutes` put the
+    first timepoint 48 days AFTER the seventieth, the median-of-gaps interval
+    silently dropped one sample, and the run ordering used when merging an
+    interrupted acquisition was decided by a number that had rolled over.
+    """
+    out, off, prev = [], 0, None
+    for v in values:
+        if prev is not None and v + off < prev - CLOCK_PERIOD_MS // 2:
+            off += CLOCK_PERIOD_MS
+        prev = v + off
+        out.append(prev)
+    return out
+
+
+def _median_ms(values):
+    """Median of one timepoint's clock readings, tolerant of a wrap INSIDE it.
+
+    A z-stack takes seconds, so its readings are all within seconds of each
+    other -- unless the boundary falls between them, when half read ~2**32 and
+    half read ~0. Align to the largest reading first, then take the median; the
+    result may exceed the period, which unwrap_clock then carries forward.
+    """
+    ref = max(values)
+    aligned = [v + CLOCK_PERIOD_MS if ref - v > CLOCK_PERIOD_MS // 2 else v
+               for v in values]
+    return int(np.median(aligned))
+
+
+def run_stamp(image_dir):
+    """The acquisition start encoded in an ACQUIFER folder name, or None.
+
+    `260825102428_P01` is 2026-08-25 10:24:28. This is the only ordering
+    signal that survives a clock wrap, so merging prefers it over the T token.
+    """
+    m = re.match(r"(\d{12})(?:[_-]|$)",
+                 os.path.basename(image_dir.rstrip(os.sep)))
+    return m.group(1) if m else None
+
 _CORE = re.compile(
     r"(?P<row>[A-Z])(?P<col>\d+)--PO\d+--LO(?P<tp>\d+)--CO(?P<ch>\d+)--SL(?P<sl>\d+)--")
 _TOKEN = re.compile(r"--(?P<k>[A-Z]{1,2})(?P<v>-?\d+)")
@@ -176,7 +227,7 @@ class RawIndex:
                 series[(pos, ch, sl)][tp] = int(rec["T"])
         gaps = []
         for tps in series.values():
-            ordered = [tps[k] for k in sorted(tps)]
+            ordered = unwrap_clock([tps[k] for k in sorted(tps)])
             gaps += [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
         if gaps:
             self.interval_min = round(float(np.median(gaps)) / 60000.0, 4)
@@ -186,13 +237,23 @@ class RawIndex:
         # interrupted acquisition does NOT have a constant step, so anything
         # reasoning about elapsed time must read actual times rather than
         # multiply the index by an interval.
+        #
+        # The clock WRAPS (see unwrap_clock), so both the per-timepoint median
+        # and the series across timepoints have to be taken on an unwrapped
+        # axis. Taking a plain median first would, for the one timepoint whose
+        # z-stack straddles the boundary, average a huge pre-wrap reading with
+        # a tiny post-wrap one and land ~24 days from either.
         by_tp = defaultdict(list)
         for (_p, tp, _c, _s), rec_t in frames.items():
             if rec_t[0].get("T") is not None:
                 by_tp[tp].append(int(rec_t[0]["T"]))
-        self.tp_time_ms = {tp: int(np.median(v)) for tp, v in by_tp.items()}
+        order = sorted(by_tp)
+        raw_med = [_median_ms(by_tp[tp]) for tp in order]
+        self.clock_wraps = sum(1 for a, b in zip(raw_med, raw_med[1:])
+                               if b < a - CLOCK_PERIOD_MS // 2)
+        self.tp_time_ms = dict(zip(order, unwrap_clock(raw_med)))
         if self.tp_time_ms:
-            t0 = min(self.tp_time_ms.values())
+            t0 = self.tp_time_ms[order[0]]
             self.tp_minutes = {tp: round((t - t0) / 60000.0, 4)
                                for tp, t in self.tp_time_ms.items()}
         else:
@@ -225,6 +286,20 @@ class RawIndex:
         rec = self.frames[key]
         folder = rec[3] if len(rec) > 3 else self.image_dir
         return os.path.join(folder, rec[2])
+
+    def read(self, key):
+        """The 2-D plane for this key.
+
+        Here one frame IS one file, so this is just a read. It exists so that
+        process.py can go through `idx.read(key)` for every frame and work
+        unchanged on formats where a frame is a slice inside a larger container
+        -- see nikon_nd2.ND2Index, where a frame is one plane of a 21 GB .nd2.
+        """
+        from process import read_frame          # local: avoids a cycle
+        return read_frame(self.path(key))
+
+    def close(self):
+        """Nothing to release; present so callers can treat readers alike."""
 
     def files_for(self, pos, channel, slice_=None):
         out = []
@@ -261,6 +336,26 @@ class RawIndex:
             f"CROP          {c} px  =  {fov_mm} mm  ->  resized to {output_px}x{output_px}"
             if c else "CROP          cannot be derived (no pixel size)",
         ]
+        if getattr(self, "clock_wraps", 0):
+            L.insert(-1, f"clock         {self.clock_wraps} 32-bit wrap(s) "
+                         f"unwrapped in the T token")
+        if self.segments:
+            L.append("")
+            L.append(f"SEGMENTS      {len(self.segments)} runs merged "
+                     f"(elapsed minutes are REAL, not index x interval)")
+            for s in self.segments:
+                L.append(f"  {os.path.basename(s['dir'])}  "
+                         f"LO{s['new_tp'][0]:03d}..LO{s['new_tp'][1]:03d}  "
+                         f"t = {s.get('start_min')}..{s.get('end_min')} min  "
+                         f"{len(s.get('wells', []))} wells")
+                if s.get("wells_absent"):
+                    L.append(f"      absent here: {', '.join(s['wells_absent'])}")
+            seams = [(a, b) for a, b in zip(self.segments, self.segments[1:])]
+            for a, b in seams:
+                if a.get("end_min") is not None and b.get("start_min") is not None:
+                    L.append(f"  break        {b['start_min'] - a['end_min']:.1f} min "
+                             f"between LO{a['new_tp'][1]:03d} and "
+                             f"LO{b['new_tp'][0]:03d}")
         return "\n".join(x for x in L if x)
 
 
@@ -269,8 +364,8 @@ def index_folders(raw_dirs, read_shape: bool = True, progress=None):
 
     An interrupted acquisition restarts its LO counter at 1, so the folders
     cannot simply be concatenated -- the timepoints would collide. Runs are
-    sorted by their own clock, then later runs are renumbered to continue the
-    earlier ones.
+    ordered by acquisition start, then later runs are renumbered to continue
+    the earlier ones. Wells present in only some of the runs are kept.
 
     The gap between runs is NOT the normal interval, and pretending otherwise
     would quietly corrupt anything that reasons about elapsed time. So the
@@ -283,15 +378,21 @@ def index_folders(raw_dirs, read_shape: bool = True, progress=None):
     if len(idxs) == 1:
         return idxs[0]
 
-    def t0(i):
-        ts = [int(r[0]["T"]) for r in i.frames.values() if r[0].get("T")]
-        return min(ts) if ts else 0
-    idxs.sort(key=t0)
+    # ORDER THE RUNS. The T token cannot be trusted for this: it is a 32-bit
+    # counter that keeps running between runs, so an acquisition spanning the
+    # wrap makes the earlier run the numerically larger one. The folder name
+    # carries the real start time, so use it whenever every run has one and
+    # fall back to the (now unwrapped) clock only when it does not.
+    stamps = [run_stamp(i.image_dir) for i in idxs]
+    if all(stamps):
+        idxs = [idxs[k] for k in sorted(range(len(idxs)), key=lambda k: stamps[k])]
+    else:
+        idxs.sort(key=lambda i: (min(i.tp_time_ms.values())
+                                 if i.tp_time_ms else 0))
 
     first = idxs[0]
     for other in idxs[1:]:
-        for attr, label in (("positions", "wells"), ("channels", "channels"),
-                            ("slices", "z-slices")):
+        for attr, label in (("channels", "channels"), ("slices", "z-slices")):
             if getattr(first, attr) != getattr(other, attr):
                 raise ValueError(
                     f"cannot merge runs: {label} differ.\n"
@@ -303,6 +404,15 @@ def index_folders(raw_dirs, read_shape: bool = True, progress=None):
                 f"({first.frame_shape} @ {first.um_per_px} um/px vs "
                 f"{other.frame_shape} @ {other.um_per_px}).")
 
+    # WELLS MAY LEGITIMATELY DIFFER, and this used to be a hard error. An
+    # embryo that died, hatched or was deliberately dropped is simply absent
+    # from the restarted run -- refusing to merge for that would mean either
+    # processing the plate as two unrelated halves or re-imaging it. The merged
+    # index holds the UNION; which wells each run actually contains is recorded
+    # per segment so that nothing downstream assumes every well spans the whole
+    # time course.
+    all_pos = sorted({p for i in idxs for p in i.positions})
+
     merged, offset, segments = {}, 0, []
     for i in idxs:
         hi = max(i.timepoints)
@@ -310,12 +420,20 @@ def index_folders(raw_dirs, read_shape: bool = True, progress=None):
             merged[(pos, tp + offset, ch, sl)] = rec
         segments.append({"dir": i.image_dir, "n_frames": len(i.frames),
                          "orig_tp": [min(i.timepoints), hi],
-                         "new_tp": [1 + offset, hi + offset]})
+                         "new_tp": [1 + offset, hi + offset],
+                         "wells": sorted(i.positions),
+                         "wells_absent": [p for p in all_pos
+                                          if p not in set(i.positions)]})
         offset += hi
 
     out = RawIndex(first.image_dir, merged, first.frame_shape, first.frame_dtype)
     out.segments = segments
     out.source_dirs = [i.image_dir for i in idxs]
+    # Real elapsed time at each seam, so "which timepoint is the break" is a
+    # lookup rather than an inference from the index.
+    for s in out.segments:
+        s["start_min"] = out.tp_minutes.get(s["new_tp"][0])
+        s["end_min"] = out.tp_minutes.get(s["new_tp"][1])
     return out
 
 
@@ -350,6 +468,15 @@ def index_folder(raw_dir: str, read_shape: bool = True,
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) < 2:
-        raise SystemExit("usage: acquifer.py <raw-folder>")
-    print(index_folder(sys.argv[1]).summary())
+    args = sys.argv[1:]
+    if not args:
+        raise SystemExit("usage: acquifer.py <raw-folder> [--merge-runs] "
+                         "[--um-per-px X]")
+    um = None
+    if "--um-per-px" in args:
+        um = float(args[args.index("--um-per-px") + 1])
+    root = args[0]
+    if "--merge-runs" in args:
+        print(index_folders(find_image_dirs(root)).summary(um_per_px=um))
+    else:
+        print(index_folder(root).summary(um_per_px=um))
